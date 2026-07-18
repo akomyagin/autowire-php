@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace Akomyagin\AutowirePHP;
 
+use Akomyagin\AutowirePHP\Exception\NotFoundException;
+use Akomyagin\AutowirePHP\Exception\NotInstantiableException;
+
 /**
  * Framework-agnostic dependency injection container.
  *
@@ -36,25 +39,57 @@ final class Container
      */
     public function bind(string $abstract, string $concrete): void
     {
-        // TODO(Stage 1): validate that $concrete is instantiable and store binding.
         $this->bindings[$abstract] = $concrete;
     }
 
     /**
      * Resolve an instance for the given class-string id.
      *
+     * Roadmap (see docs/TECHNICAL_PLAN.md):
+     *   - Stage 2: reflection-based constructor autowiring.
+     *   - Stage 3: interface-aware circular dependency detection.
+     *   - Stage 4: honor singleton vs transient lifecycle.
+     *   - Stage 5: handle union/nullable/default/variadic constructor params.
+     *
      * @template T of object
      * @param class-string<T> $id
      * @return T
+     *
+     * @throws NotFoundException when the id is neither a binding nor an existing type.
+     * @throws NotInstantiableException when the resolved type cannot be instantiated.
      */
     public function get(string $id): object
     {
-        // TODO(Stage 1): resolve explicit bindings, then instantiate.
-        // TODO(Stage 2): reflection-based constructor autowiring.
-        // TODO(Stage 3): interface-aware circular dependency detection.
-        // TODO(Stage 4): honor singleton vs transient lifecycle.
-        // TODO(Stage 5): handle union/nullable/default/variadic constructor params.
-        throw new \LogicException('Container::get() is not implemented yet (see docs/TECHNICAL_PLAN.md).');
+        $concrete = $this->bindings[$id] ?? $id;
+
+        if (!class_exists($concrete) && !interface_exists($concrete)) {
+            throw new NotFoundException($concrete);
+        }
+
+        $reflection = new \ReflectionClass($concrete);
+
+        if (!$reflection->isInstantiable()) {
+            if ($reflection->isInterface()) {
+                $reason = 'It is an interface with no binding registered.';
+            } elseif ($reflection->isAbstract()) {
+                $reason = 'It is an abstract class.';
+            } else {
+                $reason = 'It cannot be instantiated (e.g. private or protected constructor).';
+            }
+
+            throw new NotInstantiableException($concrete, $reason);
+        }
+
+        $constructor = $reflection->getConstructor();
+
+        if ($constructor !== null && $constructor->getNumberOfRequiredParameters() > 0) {
+            throw new NotInstantiableException(
+                $concrete,
+                'Constructor requires parameters, but autowiring is not available yet (stage 2).',
+            );
+        }
+
+        return $reflection->newInstance();
     }
 
     /**
