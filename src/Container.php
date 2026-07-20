@@ -7,6 +7,8 @@ namespace AutowirePHP;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use ReflectionClass;
+use ReflectionNamedType;
+use ReflectionParameter;
 
 /**
  * Framework-agnostic dependency injection container.
@@ -66,16 +68,73 @@ final class Container
             throw new NotInstantiableException($concrete, $reason);
         }
 
+        return $this->build($reflection);
+    }
+
+    /**
+     * Instantiate the reflected class, autowiring its constructor parameters.
+     */
+    private function build(ReflectionClass $reflection): object
+    {
         $constructor = $reflection->getConstructor();
 
-        if ($constructor !== null && $constructor->getNumberOfRequiredParameters() > 0) {
+        if ($constructor === null) {
+            return $reflection->newInstance();
+        }
+
+        $args = [];
+
+        foreach ($constructor->getParameters() as $param) {
+            $args[] = $this->resolveParameter($param, $reflection->getName());
+        }
+
+        return $reflection->newInstanceArgs($args);
+    }
+
+    /**
+     * Resolve a single constructor parameter: class/interface types are resolved
+     * recursively through the container, otherwise the default value is used.
+     *
+     * @throws NotInstantiableException when the parameter cannot be autowired.
+     */
+    private function resolveParameter(ReflectionParameter $param, string $declaringClass): mixed
+    {
+        $type = $param->getType();
+
+        if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
+            return $this->get($type->getName());
+        }
+
+        if ($param->isDefaultValueAvailable()) {
+            return $param->getDefaultValue();
+        }
+
+        if ($type === null) {
             throw new NotInstantiableException(
-                $concrete,
-                'Constructor requires parameters, but autowiring is not available yet (stage 2).',
+                $declaringClass,
+                sprintf('Constructor parameter "$%s" has no type hint and cannot be autowired.', $param->getName()),
             );
         }
 
-        return $reflection->newInstance();
+        if ($type instanceof ReflectionNamedType) {
+            throw new NotInstantiableException(
+                $declaringClass,
+                sprintf(
+                    'Constructor parameter "$%s" is of built-in type "%s" and cannot be autowired.',
+                    $param->getName(),
+                    $type->getName(),
+                ),
+            );
+        }
+
+        throw new NotInstantiableException(
+            $declaringClass,
+            sprintf(
+                'Constructor parameter "$%s" has type "%s" and cannot be autowired.',
+                $param->getName(),
+                (string) $type,
+            ),
+        );
     }
 
     /**

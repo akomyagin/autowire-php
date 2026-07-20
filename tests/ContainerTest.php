@@ -85,18 +85,112 @@ final class ContainerTest extends TestCase
         $container->get(PrivateConstructor::class);
     }
 
-    public function testThrowsNotInstantiableForRequiredConstructorParameters(): void
+    public function testAutowiresConcreteDependencyGraph(): void
+    {
+        $container = new Container();
+
+        $a = $container->get(GraphA::class);
+
+        self::assertInstanceOf(GraphA::class, $a);
+        self::assertInstanceOf(GraphB::class, $a->b);
+        self::assertInstanceOf(GraphC::class, $a->c);
+        self::assertInstanceOf(GraphD::class, $a->b->d);
+    }
+
+    public function testAutowiresSingleLevelDependency(): void
+    {
+        $container = new Container();
+
+        $b = $container->get(GraphB::class);
+
+        self::assertInstanceOf(GraphD::class, $b->d);
+    }
+
+    public function testResolvesInterfaceConstructorParameterThroughBinding(): void
+    {
+        $container = new Container();
+        $container->bind(FooInterface::class, Foo::class);
+
+        $n = $container->get(NeedsFoo::class);
+
+        self::assertInstanceOf(NeedsFoo::class, $n);
+        self::assertInstanceOf(Foo::class, $n->foo);
+        self::assertInstanceOf(FooInterface::class, $n->foo);
+    }
+
+    public function testTransientByDefaultCreatesFreshDependencies(): void
+    {
+        $container = new Container();
+
+        $b1 = $container->get(GraphB::class);
+        $b2 = $container->get(GraphB::class);
+
+        self::assertNotSame($b1, $b2);
+        self::assertNotSame($b1->d, $b2->d);
+    }
+
+    public function testThrowsNotInstantiableForInterfaceParameterWithoutBinding(): void
     {
         $container = new Container();
 
         try {
-            $container->get(RequiredParamConstructor::class);
+            $container->get(NeedsFoo::class);
             self::fail('Expected NotInstantiableException was not thrown.');
         } catch (NotInstantiableException $exception) {
-            self::assertStringContainsString('autowiring', $exception->getMessage());
-            self::assertStringContainsString('stage 2', $exception->getMessage());
-            self::assertSame(RequiredParamConstructor::class, $exception->getClassName());
-            self::assertStringContainsString('stage 2', $exception->getReason());
+            self::assertStringContainsString('interface', $exception->getMessage());
+            self::assertStringNotContainsString('stage', $exception->getMessage());
+            self::assertSame(FooInterface::class, $exception->getClassName());
+        }
+    }
+
+    public function testThrowsNotInstantiableForBuiltinParameterWithoutDefault(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(NeedsBuiltinNoDefault::class);
+            self::fail('Expected NotInstantiableException was not thrown.');
+        } catch (NotInstantiableException $exception) {
+            self::assertSame(NeedsBuiltinNoDefault::class, $exception->getClassName());
+            self::assertStringContainsString('count', $exception->getMessage());
+            self::assertStringContainsString('built-in', $exception->getReason());
+            self::assertStringNotContainsString('stage', $exception->getMessage());
+        }
+    }
+
+    public function testThrowsNotInstantiableForUntypedParameter(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(NeedsUntyped::class);
+            self::fail('Expected NotInstantiableException was not thrown.');
+        } catch (NotInstantiableException $exception) {
+            self::assertSame(NeedsUntyped::class, $exception->getClassName());
+            self::assertStringContainsString('whatever', $exception->getMessage());
+        }
+    }
+
+    public function testResolvesMixedClassAndDefaultBuiltinParameters(): void
+    {
+        $container = new Container();
+
+        $m = $container->get(MixedClassAndDefault::class);
+
+        self::assertInstanceOf(GraphD::class, $m->d);
+        self::assertSame(7, $m->x);
+    }
+
+    public function testThrowsNotInstantiableForUnionTypedParameterWithoutDefault(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(NeedsUnion::class);
+            self::fail('Expected NotInstantiableException was not thrown.');
+        } catch (NotInstantiableException $exception) {
+            self::assertSame(NeedsUnion::class, $exception->getClassName());
+            self::assertStringContainsString('v', $exception->getMessage());
         }
     }
 
@@ -192,13 +286,6 @@ final class OptionalParamsConstructor
     }
 }
 
-final class RequiredParamConstructor
-{
-    public function __construct(FooInterface $foo)
-    {
-    }
-}
-
 abstract class AbstractThing
 {
 }
@@ -206,6 +293,63 @@ abstract class AbstractThing
 final class PrivateConstructor
 {
     private function __construct()
+    {
+    }
+}
+
+final class GraphD
+{
+}
+
+final class GraphB
+{
+    public function __construct(public readonly GraphD $d)
+    {
+    }
+}
+
+final class GraphC
+{
+}
+
+final class GraphA
+{
+    public function __construct(public readonly GraphB $b, public readonly GraphC $c)
+    {
+    }
+}
+
+final class NeedsFoo
+{
+    public function __construct(public readonly FooInterface $foo)
+    {
+    }
+}
+
+final class NeedsBuiltinNoDefault
+{
+    public function __construct(public readonly int $count)
+    {
+    }
+}
+
+final class NeedsUntyped
+{
+    public function __construct($whatever)
+    {
+    }
+}
+
+final class MixedClassAndDefault
+{
+    public function __construct(public readonly GraphD $d, public readonly int $x = 7)
+    {
+    }
+}
+
+final class NeedsUnion
+{
+    public function __construct(int|string $v)
     {
     }
 }
