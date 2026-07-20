@@ -18,12 +18,12 @@
     },
     "autoload": {
         "psr-4": {
-            "Akomyagin\\AutowirePHP\\": "src/"
+            "AutowirePHP\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "Akomyagin\\AutowirePHP\\Tests\\": "tests/"
+            "AutowirePHP\\Tests\\": "tests/"
         }
     },
     "scripts": {

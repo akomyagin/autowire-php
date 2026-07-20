@@ -17,11 +17,14 @@ Learning-проект, **первый на чистом PHP** во всём по
 
 | Путь | Содержимое |
 |---|---|
-| `src/` | Код библиотеки, namespace `Akomyagin\AutowirePHP\`, PSR-4 |
-| `tests/` | PHPUnit-тесты, namespace `Akomyagin\AutowirePHP\Tests\` |
-| `docs/` | PLAN, TECHNICAL_PLAN, POST_MVP_PLAN |
-| `.claude/skills/php-di-dev/` | Конвенции: Reflection-паттерны, алгоритм детекта циклов, стиль тестов |
+| `src/` | Код библиотеки, namespace `AutowirePHP\`, PSR-4 |
+| `tests/` | PHPUnit-тесты, namespace `AutowirePHP\Tests\` |
+| `docs/` | PLAN, TECHNICAL_PLAN, POST_MVP_PLAN (локально, не в git) |
+| `.claude/skills/php-di-dev/` | Конвенции: Reflection-паттерны, алгоритм детекта циклов, стиль тестов (локально, не в git) |
 | `composer.json` / `phpunit.xml` | Зависимости, автозагрузка, конфиг тестов |
+
+`docs/` и `.claude/` присутствуют только в локальной рабочей копии (в `.gitignore`) —
+не пушатся и не видны в свежем клоне репозитория.
 
 Внешних сервисов нет: ни БД, ни Docker, ни сети. Чистая composer-библиотека.
 

@@ -2,20 +2,23 @@
 
 declare(strict_types=1);
 
-namespace Akomyagin\AutowirePHP\Exception;
+namespace AutowirePHP\Exception;
+
+use RuntimeException;
+use Throwable;
 
 /**
  * Thrown when the resolved type exists but cannot be instantiated: an
  * interface without a binding, an abstract class, a private/protected
- * constructor, or a constructor with required parameters (until autowiring
- * arrives in stage 2).
+ * constructor, or a constructor requiring parameters the container cannot
+ * resolve.
  */
-final class NotInstantiableException extends \RuntimeException implements ContainerException
+final class NotInstantiableException extends RuntimeException implements ContainerException
 {
     public function __construct(
         private readonly string $className,
         private readonly string $reason = '',
-        ?\Throwable $previous = null,
+        ?Throwable $previous = null,
     ) {
         $message = sprintf('Class "%s" is not instantiable.', $className);
 

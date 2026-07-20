@@ -2,11 +2,13 @@
 
 declare(strict_types=1);
 
-namespace Akomyagin\AutowirePHP\Exception;
+namespace AutowirePHP\Exception;
+
+use Throwable;
 
 /**
  * Marker interface implemented by every exception thrown by the container.
  */
-interface ContainerException extends \Throwable
+interface ContainerException extends Throwable
 {
 }

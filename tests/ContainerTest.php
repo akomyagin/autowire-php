@@ -2,25 +2,22 @@
 
 declare(strict_types=1);
 
-namespace Akomyagin\AutowirePHP\Tests;
+namespace AutowirePHP\Tests;
 
-use Akomyagin\AutowirePHP\Container;
-use Akomyagin\AutowirePHP\Exception\ContainerException;
-use Akomyagin\AutowirePHP\Exception\NotFoundException;
-use Akomyagin\AutowirePHP\Exception\NotInstantiableException;
+use AutowirePHP\Container;
+use AutowirePHP\Exception\ContainerException;
+use AutowirePHP\Exception\NotFoundException;
+use AutowirePHP\Exception\NotInstantiableException;
 use PHPUnit\Framework\TestCase;
+use stdClass;
 
 final class ContainerTest extends TestCase
 {
-    /**
-     * Stage 0 smoke test: the container can be constructed and reports the
-     * absence of a binding. Real resolution behaviour arrives in Stage 1.
-     */
     public function testContainerReportsNoBindingByDefault(): void
     {
         $container = new Container();
 
-        self::assertFalse($container->has(\stdClass::class));
+        self::assertFalse($container->has(stdClass::class));
     }
 
     public function testResolvesInterfaceThroughBinding(): void

@@ -2,24 +2,16 @@
 
 declare(strict_types=1);
 
-namespace Akomyagin\AutowirePHP;
+namespace AutowirePHP;
 
-use Akomyagin\AutowirePHP\Exception\NotFoundException;
-use Akomyagin\AutowirePHP\Exception\NotInstantiableException;
+use AutowirePHP\Exception\NotFoundException;
+use AutowirePHP\Exception\NotInstantiableException;
+use ReflectionClass;
 
 /**
  * Framework-agnostic dependency injection container.
  *
- * The container resolves object graphs through the PHP Reflection API. Its
- * public surface will grow stage by stage; this skeleton exists so that
- * `composer test` has a real class to autoload and exercise from day one.
- *
- * Stage roadmap (see docs/TECHNICAL_PLAN.md):
- *   - Stage 1: manual interface -> implementation bindings, no autowiring.
- *   - Stage 2: reflection-based constructor autowiring (recursive resolution).
- *   - Stage 3: interface-aware circular dependency detection (resolution stack).
- *   - Stage 4: lifecycle control (singleton vs transient).
- *   - Stage 5: constructor edge cases (union types, nullable, defaults, variadic).
+ * Resolves object graphs through the PHP Reflection API.
  */
 final class Container
 {
@@ -45,12 +37,6 @@ final class Container
     /**
      * Resolve an instance for the given class-string id.
      *
-     * Roadmap (see docs/TECHNICAL_PLAN.md):
-     *   - Stage 2: reflection-based constructor autowiring.
-     *   - Stage 3: interface-aware circular dependency detection.
-     *   - Stage 4: honor singleton vs transient lifecycle.
-     *   - Stage 5: handle union/nullable/default/variadic constructor params.
-     *
      * @template T of object
      * @param class-string<T> $id
      * @return T
@@ -66,7 +52,7 @@ final class Container
             throw new NotFoundException($concrete);
         }
 
-        $reflection = new \ReflectionClass($concrete);
+        $reflection = new ReflectionClass($concrete);
 
         if (!$reflection->isInstantiable()) {
             if ($reflection->isInterface()) {

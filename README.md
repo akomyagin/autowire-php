@@ -30,7 +30,7 @@ composer require akomyagin/autowire-php
 ## Пример (целевой API)
 
 ```php
-use Akomyagin\AutowirePHP\Container;
+use AutowirePHP\Container;
 
 interface LoggerInterface {}
 final class FileLogger implements LoggerInterface {}
