@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace AutowirePHP\Tests;
 
 use AutowirePHP\Container;
+use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use PHPUnit\Framework\TestCase;
+use ReflectionObject;
 use stdClass;
 
 final class ContainerTest extends TestCase
@@ -255,6 +257,182 @@ final class ContainerTest extends TestCase
 
         self::assertInstanceOf(Foo::class, $container->get(Foo::class));
     }
+
+    public function testDetectsDirectCycleBetweenConcreteClasses(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(DirectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chain = $exception->getChain();
+
+            self::assertSame(DirectCycleA::class, end($chain));
+            self::assertContains(DirectCycleA::class, $chain);
+            self::assertContains(DirectCycleB::class, $chain);
+        }
+    }
+
+    public function testDetectsCycleThroughInterfaces(): void
+    {
+        $container = new Container();
+        $container->bind(CycleIA::class, CycleA::class);
+        $container->bind(CycleIB::class, CycleB::class);
+
+        try {
+            $container->get(CycleIA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chain = $exception->getChain();
+
+            self::assertContains(CycleIA::class, $chain);
+            self::assertContains(CycleIB::class, $chain);
+            self::assertContains(CycleA::class, $chain);
+            self::assertContains(CycleB::class, $chain);
+        }
+    }
+
+    public function testDetectsSelfDependency(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(SelfCycle::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            self::assertSame([SelfCycle::class, SelfCycle::class], $exception->getChain());
+        }
+    }
+
+    public function testDetectsIndirectCycleOfLengthThreeThroughInterfaces(): void
+    {
+        $container = new Container();
+        $container->bind(ChainI1::class, Chain1::class);
+        $container->bind(ChainI2::class, Chain2::class);
+        $container->bind(ChainI3::class, Chain3::class);
+
+        try {
+            $container->get(ChainI1::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chain = $exception->getChain();
+
+            self::assertSame(ChainI1::class, $chain[0]);
+            self::assertSame(ChainI1::class, end($chain));
+            self::assertGreaterThanOrEqual(6, count($chain));
+        }
+    }
+
+    public function testCircularExceptionMessageContainsReadableChain(): void
+    {
+        $container = new Container();
+        $container->bind(CycleIA::class, CycleA::class);
+        $container->bind(CycleIB::class, CycleB::class);
+
+        try {
+            $container->get(CycleIA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $message = $exception->getMessage();
+
+            self::assertStringContainsString(' -> ', $message);
+            self::assertStringContainsString(CycleIA::class, $message);
+            self::assertStringContainsString(CycleIB::class, $message);
+            self::assertStringContainsString(CycleA::class, $message);
+            self::assertStringContainsString(CycleB::class, $message);
+            self::assertStringNotContainsString('stage', $message);
+            self::assertSame(
+                'Circular dependency detected: ' . implode(' -> ', $exception->getChain()) . '.',
+                $message,
+            );
+            self::assertInstanceOf(ContainerException::class, $exception);
+        }
+    }
+
+    public function testContainerStaysUsableAfterCaughtCycle(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(DirectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chainFirst = $exception->getChain();
+        }
+
+        $a = $container->get(GraphA::class);
+
+        self::assertInstanceOf(GraphA::class, $a);
+        self::assertInstanceOf(GraphB::class, $a->b);
+        self::assertInstanceOf(GraphD::class, $a->b->d);
+
+        try {
+            $container->get(DirectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chainSecond = $exception->getChain();
+        }
+
+        self::assertSame($chainFirst, $chainSecond);
+    }
+
+    public function testDiamondDependencyIsNotFalselyDetectedAsCycle(): void
+    {
+        $container = new Container();
+
+        $a = $container->get(DiamondA::class);
+
+        self::assertInstanceOf(DiamondA::class, $a);
+        self::assertInstanceOf(DiamondD::class, $a->b->d);
+        self::assertInstanceOf(DiamondD::class, $a->c->d);
+        self::assertNotSame($a->b->d, $a->c->d);
+    }
+
+    public function testSameDependencyTwiceInOneConstructorIsNotCycle(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsTwoD::class);
+
+        self::assertInstanceOf(TwiceD::class, $n->first);
+        self::assertInstanceOf(TwiceD::class, $n->second);
+    }
+
+    public function testDetectsIndirectCycleOfLengthThreeAmongConcreteClasses(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(ConcreteCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chain = $exception->getChain();
+
+            self::assertSame(ConcreteCycleA::class, $chain[0]);
+            self::assertSame(ConcreteCycleA::class, end($chain));
+            self::assertContains(ConcreteCycleB::class, $chain);
+            self::assertContains(ConcreteCycleC::class, $chain);
+        }
+    }
+
+    public function testResolutionStackIsEmptyAfterSuccessfulGet(): void
+    {
+        $container = new Container();
+
+        $container->get(DiamondA::class);
+
+        $reflection = new ReflectionObject($container);
+
+        $resolving = $reflection->getProperty('resolving');
+        $resolving->setAccessible(true);
+
+        $resolutionChain = $reflection->getProperty('resolutionChain');
+        $resolutionChain->setAccessible(true);
+
+        self::assertSame([], $resolving->getValue($container));
+        self::assertSame([], $resolutionChain->getValue($container));
+    }
 }
 
 // Fixture classes for the resolution scenarios above. Kept in the same file so
@@ -350,6 +528,143 @@ final class MixedClassAndDefault
 final class NeedsUnion
 {
     public function __construct(int|string $v)
+    {
+    }
+}
+
+final class DirectCycleA
+{
+    public function __construct(public readonly DirectCycleB $b)
+    {
+    }
+}
+
+final class DirectCycleB
+{
+    public function __construct(public readonly DirectCycleA $a)
+    {
+    }
+}
+
+interface CycleIA
+{
+}
+
+interface CycleIB
+{
+}
+
+final class CycleA implements CycleIA
+{
+    public function __construct(public readonly CycleIB $b)
+    {
+    }
+}
+
+final class CycleB implements CycleIB
+{
+    public function __construct(public readonly CycleIA $a)
+    {
+    }
+}
+
+final class SelfCycle
+{
+    public function __construct(public readonly SelfCycle $self)
+    {
+    }
+}
+
+interface ChainI1
+{
+}
+
+interface ChainI2
+{
+}
+
+interface ChainI3
+{
+}
+
+final class Chain1 implements ChainI1
+{
+    public function __construct(public readonly ChainI2 $b)
+    {
+    }
+}
+
+final class Chain2 implements ChainI2
+{
+    public function __construct(public readonly ChainI3 $c)
+    {
+    }
+}
+
+final class Chain3 implements ChainI3
+{
+    public function __construct(public readonly ChainI1 $a)
+    {
+    }
+}
+
+final class DiamondD
+{
+}
+
+final class DiamondB
+{
+    public function __construct(public readonly DiamondD $d)
+    {
+    }
+}
+
+final class DiamondC
+{
+    public function __construct(public readonly DiamondD $d)
+    {
+    }
+}
+
+final class DiamondA
+{
+    public function __construct(
+        public readonly DiamondB $b,
+        public readonly DiamondC $c,
+    ) {
+    }
+}
+
+final class TwiceD
+{
+}
+
+final class NeedsTwoD
+{
+    public function __construct(
+        public readonly TwiceD $first,
+        public readonly TwiceD $second,
+    ) {
+    }
+}
+
+final class ConcreteCycleA
+{
+    public function __construct(public readonly ConcreteCycleB $b)
+    {
+    }
+}
+
+final class ConcreteCycleB
+{
+    public function __construct(public readonly ConcreteCycleC $c)
+    {
+    }
+}
+
+final class ConcreteCycleC
+{
+    public function __construct(public readonly ConcreteCycleA $a)
     {
     }
 }
