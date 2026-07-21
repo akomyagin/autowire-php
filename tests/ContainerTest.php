@@ -433,6 +433,136 @@ final class ContainerTest extends TestCase
         self::assertSame([], $resolving->getValue($container));
         self::assertSame([], $resolutionChain->getValue($container));
     }
+
+    public function testSingletonReturnsSameInstanceOnRepeatedGet(): void
+    {
+        $container = new Container();
+        $container->singleton(SharedService::class);
+
+        $a = $container->get(SharedService::class);
+        $b = $container->get(SharedService::class);
+
+        self::assertSame($a, $b);
+    }
+
+    public function testTransientBindingReturnsFreshInstanceOnRepeatedGet(): void
+    {
+        $container = new Container();
+        $container->bind(FooInterface::class, Foo::class);
+
+        $a = $container->get(FooInterface::class);
+        $b = $container->get(FooInterface::class);
+
+        self::assertNotSame($a, $b);
+    }
+
+    public function testSingletonThroughInterfaceBindingReturnsSameInstance(): void
+    {
+        $container = new Container();
+        $container->singleton(FooInterface::class, Foo::class);
+
+        $a = $container->get(FooInterface::class);
+        $b = $container->get(FooInterface::class);
+
+        self::assertSame($a, $b);
+    }
+
+    public function testSingletonDependencyIsSharedBetweenTwoConsumers(): void
+    {
+        $container = new Container();
+        $container->singleton(SharedDep::class);
+
+        $c1 = $container->get(ConsumerOne::class);
+        $c2 = $container->get(ConsumerTwo::class);
+
+        self::assertSame($c1->dep, $c2->dep);
+    }
+
+    public function testSingletonInterfaceDependencyIsSharedBetweenTwoConsumers(): void
+    {
+        $container = new Container();
+        $container->singleton(SharedDepInterface::class, SharedDepImpl::class);
+
+        $a = $container->get(NeedsSharedA::class);
+        $b = $container->get(NeedsSharedB::class);
+
+        self::assertSame($a->dep, $b->dep);
+        self::assertInstanceOf(SharedDepImpl::class, $a->dep);
+    }
+
+    public function testTransientDependencyIsNotSharedBetweenConsumers(): void
+    {
+        $container = new Container();
+
+        $c1 = $container->get(ConsumerOne::class);
+        $c2 = $container->get(ConsumerTwo::class);
+
+        self::assertNotSame($c1->dep, $c2->dep);
+    }
+
+    public function testConsumerItselfSingletonSharesWholeSubtree(): void
+    {
+        $container = new Container();
+        $container->singleton(ConsumerOne::class);
+        $container->singleton(SharedDep::class);
+
+        $x = $container->get(ConsumerOne::class);
+        $y = $container->get(ConsumerOne::class);
+
+        self::assertSame($x, $y);
+        self::assertSame($x->dep, $y->dep);
+    }
+
+    public function testSingletonClassInCycleStillDetectsCycle(): void
+    {
+        $container = new Container();
+        $container->singleton(DirectCycleA::class);
+
+        try {
+            $container->get(DirectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            self::assertContains(DirectCycleA::class, $exception->getChain());
+        }
+
+        // The second call throws again, proving the failed resolution did not
+        // leave a half-built object in the singleton cache.
+        try {
+            $container->get(DirectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            self::assertContains(DirectCycleA::class, $exception->getChain());
+        }
+    }
+
+    public function testSingletonCacheDoesNotBreakDiamond(): void
+    {
+        $container = new Container();
+        $container->singleton(DiamondD::class);
+
+        $a = $container->get(DiamondA::class);
+
+        self::assertSame($a->b->d, $a->c->d);
+    }
+
+    public function testResolutionStackIsEmptyAfterSingletonGet(): void
+    {
+        $container = new Container();
+        $container->singleton(SharedDep::class);
+
+        $container->get(ConsumerOne::class);
+
+        $reflection = new ReflectionObject($container);
+
+        $resolving = $reflection->getProperty('resolving');
+        $resolving->setAccessible(true);
+
+        $resolutionChain = $reflection->getProperty('resolutionChain');
+        $resolutionChain->setAccessible(true);
+
+        self::assertSame([], $resolving->getValue($container));
+        self::assertSame([], $resolutionChain->getValue($container));
+    }
 }
 
 // Fixture classes for the resolution scenarios above. Kept in the same file so
@@ -665,6 +795,50 @@ final class ConcreteCycleB
 final class ConcreteCycleC
 {
     public function __construct(public readonly ConcreteCycleA $a)
+    {
+    }
+}
+
+final class SharedService
+{
+}
+
+final class SharedDep
+{
+}
+
+final class ConsumerOne
+{
+    public function __construct(public readonly SharedDep $dep)
+    {
+    }
+}
+
+final class ConsumerTwo
+{
+    public function __construct(public readonly SharedDep $dep)
+    {
+    }
+}
+
+interface SharedDepInterface
+{
+}
+
+final class SharedDepImpl implements SharedDepInterface
+{
+}
+
+final class NeedsSharedA
+{
+    public function __construct(public readonly SharedDepInterface $dep)
+    {
+    }
+}
+
+final class NeedsSharedB
+{
+    public function __construct(public readonly SharedDepInterface $dep)
     {
     }
 }
