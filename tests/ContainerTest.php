@@ -9,6 +9,7 @@ use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
+use AutowirePHP\Exception\UnresolvableParameterException;
 use PHPUnit\Framework\TestCase;
 use ReflectionObject;
 use stdClass;
@@ -145,31 +146,33 @@ final class ContainerTest extends TestCase
         }
     }
 
-    public function testThrowsNotInstantiableForBuiltinParameterWithoutDefault(): void
+    public function testThrowsUnresolvableForBuiltinParameterWithoutDefault(): void
     {
         $container = new Container();
 
         try {
             $container->get(NeedsBuiltinNoDefault::class);
-            self::fail('Expected NotInstantiableException was not thrown.');
-        } catch (NotInstantiableException $exception) {
+            self::fail('Expected UnresolvableParameterException was not thrown.');
+        } catch (UnresolvableParameterException $exception) {
             self::assertSame(NeedsBuiltinNoDefault::class, $exception->getClassName());
-            self::assertStringContainsString('count', $exception->getMessage());
+            self::assertSame('count', $exception->getParameterName());
             self::assertStringContainsString('built-in', $exception->getReason());
             self::assertStringNotContainsString('stage', $exception->getMessage());
+            self::assertInstanceOf(ContainerException::class, $exception);
         }
     }
 
-    public function testThrowsNotInstantiableForUntypedParameter(): void
+    public function testThrowsUnresolvableForUntypedParameter(): void
     {
         $container = new Container();
 
         try {
             $container->get(NeedsUntyped::class);
-            self::fail('Expected NotInstantiableException was not thrown.');
-        } catch (NotInstantiableException $exception) {
+            self::fail('Expected UnresolvableParameterException was not thrown.');
+        } catch (UnresolvableParameterException $exception) {
             self::assertSame(NeedsUntyped::class, $exception->getClassName());
-            self::assertStringContainsString('whatever', $exception->getMessage());
+            self::assertSame('whatever', $exception->getParameterName());
+            self::assertInstanceOf(ContainerException::class, $exception);
         }
     }
 
@@ -183,16 +186,17 @@ final class ContainerTest extends TestCase
         self::assertSame(7, $m->x);
     }
 
-    public function testThrowsNotInstantiableForUnionTypedParameterWithoutDefault(): void
+    public function testThrowsUnresolvableForUnionTypedParameterWithoutDefault(): void
     {
         $container = new Container();
 
         try {
             $container->get(NeedsUnion::class);
-            self::fail('Expected NotInstantiableException was not thrown.');
-        } catch (NotInstantiableException $exception) {
+            self::fail('Expected UnresolvableParameterException was not thrown.');
+        } catch (UnresolvableParameterException $exception) {
             self::assertSame(NeedsUnion::class, $exception->getClassName());
-            self::assertStringContainsString('v', $exception->getMessage());
+            self::assertSame('v', $exception->getParameterName());
+            self::assertInstanceOf(ContainerException::class, $exception);
         }
     }
 
@@ -563,6 +567,112 @@ final class ContainerTest extends TestCase
         self::assertSame([], $resolving->getValue($container));
         self::assertSame([], $resolutionChain->getValue($container));
     }
+
+    public function testNullableClassParameterIsResolvedWhenPossible(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsNullableFoo::class);
+
+        self::assertInstanceOf(Foo::class, $n->foo);
+    }
+
+    public function testNullableInterfaceParameterFallsBackToNullWithoutBinding(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsNullableBar::class);
+
+        self::assertNull($n->bar);
+    }
+
+    public function testUnionParameterResolvesFirstResolvableClassType(): void
+    {
+        $container = new Container();
+        $container->bind(UPrimary::class, UPrimaryImpl::class);
+
+        $n = $container->get(NeedsClassUnion::class);
+
+        self::assertInstanceOf(UPrimaryImpl::class, $n->svc);
+    }
+
+    public function testUnionSkipsUnresolvableFirstMemberAndUsesSecond(): void
+    {
+        $container = new Container();
+        $container->bind(USecondary::class, USecondaryImpl::class);
+
+        $n = $container->get(NeedsUnionOfInterfaces::class);
+
+        self::assertInstanceOf(USecondaryImpl::class, $n->svc);
+    }
+
+    public function testUnionWithoutDefaultThrowsWhenNoMemberResolvable(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(NeedsClassUnion::class);
+            self::fail('Expected UnresolvableParameterException was not thrown.');
+        } catch (UnresolvableParameterException $exception) {
+            self::assertSame(NeedsClassUnion::class, $exception->getClassName());
+            self::assertSame('svc', $exception->getParameterName());
+        }
+    }
+
+    public function testUnionWithDefaultUsesDefaultWhenNothingResolves(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsUnionWithDefault::class);
+
+        self::assertSame(0, $n->v);
+    }
+
+    public function testNullableUnionFallsBackToNull(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsNullableUnion::class);
+
+        self::assertNull($n->svc);
+    }
+
+    public function testVariadicParameterReceivesEmptySet(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsVariadic::class);
+
+        self::assertSame([], $n->foos);
+    }
+
+    public function testVariadicAfterRequiredParameterStillBuilds(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsClassThenVariadic::class);
+
+        self::assertInstanceOf(GraphD::class, $n->d);
+        self::assertSame([], $n->foos);
+    }
+
+    public function testResolutionStackIsEmptyAfterNullableFallbackToNull(): void
+    {
+        $container = new Container();
+
+        $container->get(NeedsNullableBar::class);
+
+        $reflection = new ReflectionObject($container);
+
+        $resolving = $reflection->getProperty('resolving');
+        $resolving->setAccessible(true);
+
+        $resolutionChain = $reflection->getProperty('resolutionChain');
+        $resolutionChain->setAccessible(true);
+
+        self::assertSame([], $resolving->getValue($container));
+        self::assertSame([], $resolutionChain->getValue($container));
+    }
 }
 
 // Fixture classes for the resolution scenarios above. Kept in the same file so
@@ -839,6 +949,88 @@ final class NeedsSharedA
 final class NeedsSharedB
 {
     public function __construct(public readonly SharedDepInterface $dep)
+    {
+    }
+}
+
+final class NeedsNullableFoo
+{
+    public function __construct(public readonly ?Foo $foo)
+    {
+    }
+}
+
+interface BarInterface
+{
+}
+
+final class NeedsNullableBar
+{
+    public function __construct(public readonly ?BarInterface $bar)
+    {
+    }
+}
+
+interface UPrimary
+{
+}
+
+interface USecondary
+{
+}
+
+final class UPrimaryImpl implements UPrimary
+{
+}
+
+final class USecondaryImpl implements USecondary
+{
+}
+
+final class NeedsClassUnion
+{
+    public function __construct(public readonly UPrimary|USecondary $svc)
+    {
+    }
+}
+
+final class NeedsUnionWithDefault
+{
+    public function __construct(public readonly int|string $v = 0)
+    {
+    }
+}
+
+final class NeedsUnionOfInterfaces
+{
+    public function __construct(public readonly UPrimary|USecondary $svc)
+    {
+    }
+}
+
+final class NeedsVariadic
+{
+    public array $foos;
+
+    public function __construct(Foo ...$foos)
+    {
+        $this->foos = $foos;
+    }
+}
+
+final class NeedsClassThenVariadic
+{
+    public array $foos;
+
+    public function __construct(public readonly GraphD $d, Foo ...$foos)
+    {
+        $this->foos = $foos;
+    }
+}
+
+final class NeedsNullableUnion
+{
+    public function __construct(public readonly UPrimary|USecondary|null $svc)
     {
     }
 }
