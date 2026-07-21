@@ -13,8 +13,10 @@ composer-библиотека.
 
 ## Статус
 
-В разработке. Скелет Этапа 0 на месте (`composer test` проходит). Разбивка по
-пяти MVP-этапам — в [`docs/`](docs/).
+MVP реализован: ручные биндинги, reflection-based автовайринг конструктора,
+детект циклических зависимостей через интерфейсы, lifecycle-контроль
+(singleton/transient), edge cases конструктора (nullable, union, variadic).
+Контейнер совместим с PSR-11 (`Psr\Container\ContainerInterface`).
 
 ## Требования
 
@@ -27,7 +29,7 @@ composer-библиотека.
 composer require akomyagin/autowire-php
 ```
 
-## Пример (целевой API)
+## Пример
 
 ```php
 use AutowirePHP\Container;
@@ -48,14 +50,11 @@ $container->bind(LoggerInterface::class, FileLogger::class);
 $service = $container->get(ReportService::class);
 ```
 
-> Пример отражает целевой API MVP. По мере прохождения этапов (см. ниже)
-> поведение `get()` наполняется; сейчас `get()` — заглушка.
-
 ## Документация
 
 - [`docs/PLAN.md`](docs/PLAN.md) — видение, архитектура, этапы, «После MVP».
 - [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) — стек и детальная разбивка по этапам.
-- [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md) — attributes, компиляция графа, PSR-11.
+- [`docs/POST_MVP_PLAN.md`](docs/POST_MVP_PLAN.md) — attributes-конфигурация, компиляция графа (PSR-11 уже реализован).
 
 ## Разработка
 

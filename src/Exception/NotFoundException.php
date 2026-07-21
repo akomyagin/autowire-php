@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace AutowirePHP\Exception;
 
+use Psr\Container\NotFoundExceptionInterface;
 use RuntimeException;
 use Throwable;
 
@@ -11,7 +12,7 @@ use Throwable;
  * Thrown when the requested id does not exist as a class or interface and no
  * binding is registered for it.
  */
-final class NotFoundException extends RuntimeException implements ContainerException
+final class NotFoundException extends RuntimeException implements ContainerException, NotFoundExceptionInterface
 {
     public function __construct(
         private readonly string $id,
