@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace AutowirePHP;
 
+use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use ReflectionClass;
@@ -23,6 +24,20 @@ final class Container
      * @var array<class-string, class-string>
      */
     private array $bindings = [];
+
+    /**
+     * Set of ids on the current resolution path, for O(1) cycle checks.
+     *
+     * @var array<string, true>
+     */
+    private array $resolving = [];
+
+    /**
+     * Ordered resolution path, used to build a readable cycle message.
+     *
+     * @var list<string>
+     */
+    private array $resolutionChain = [];
 
     /**
      * Register an explicit binding from an abstract id (usually an interface)
@@ -45,15 +60,68 @@ final class Container
      *
      * @throws NotFoundException when the id is neither a binding nor an existing type.
      * @throws NotInstantiableException when the resolved type cannot be instantiated.
+     * @throws CircularDependencyException when the id is already on the current resolution path.
      */
     public function get(string $id): object
     {
-        $concrete = $this->bindings[$id] ?? $id;
+        $this->enter($id);
 
-        if (!class_exists($concrete) && !interface_exists($concrete)) {
-            throw new NotFoundException($concrete);
+        try {
+            $concrete = $this->bindings[$id] ?? $id;
+
+            if (!class_exists($concrete) && !interface_exists($concrete)) {
+                throw new NotFoundException($concrete);
+            }
+
+            if ($concrete !== $id) {
+                $this->enter($concrete);
+
+                try {
+                    return $this->instantiate($concrete);
+                } finally {
+                    $this->leave($concrete);
+                }
+            }
+
+            return $this->instantiate($concrete);
+        } finally {
+            $this->leave($id);
+        }
+    }
+
+    /**
+     * Push an id onto the current resolution path, failing if it is already there.
+     *
+     * @throws CircularDependencyException when the id closes a cycle on the current path.
+     */
+    private function enter(string $id): void
+    {
+        if (isset($this->resolving[$id])) {
+            $chain = [...$this->resolutionChain, $id];
+            throw new CircularDependencyException($chain);
         }
 
+        $this->resolving[$id] = true;
+        $this->resolutionChain[] = $id;
+    }
+
+    /**
+     * Pop an id from the current resolution path.
+     */
+    private function leave(string $id): void
+    {
+        unset($this->resolving[$id]);
+        array_pop($this->resolutionChain);
+    }
+
+    /**
+     * Reflect the concrete class and delegate to build(), rejecting types that
+     * cannot be instantiated.
+     *
+     * @throws NotInstantiableException when the type cannot be instantiated.
+     */
+    private function instantiate(string $concrete): object
+    {
         $reflection = new ReflectionClass($concrete);
 
         if (!$reflection->isInstantiable()) {
