@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace AutowirePHP;
 
+use AutowirePHP\Attribute\Inject;
+use AutowirePHP\Attribute\Singleton;
 use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
 use AutowirePHP\Exception\NotFoundException;
@@ -60,7 +62,8 @@ final class Container implements ContainerInterface
 
     /**
      * Register an explicit binding from an abstract id (usually an interface)
-     * to a concrete implementation class.
+     * to a concrete implementation class. This takes precedence over any
+     * #[Inject] attribute declared on a constructor parameter of that type.
      *
      * @param class-string $abstract
      * @param class-string $concrete
@@ -74,7 +77,9 @@ final class Container implements ContainerInterface
      * Register an id as shared: the first resolved instance is cached and
      * returned on every subsequent get() for the same id. The cache is keyed
      * by $abstract, so requesting $concrete directly (bypassing $abstract)
-     * yields a separate, non-shared instance.
+     * yields a separate, non-shared instance. A class marked #[Singleton]
+     * behaves as if this method had been called for it; calling both has no
+     * additional effect.
      *
      * @param class-string $abstract
      * @param class-string|null $concrete
@@ -91,8 +96,9 @@ final class Container implements ContainerInterface
     /**
      * Resolve an instance for the given class-string id.
      *
-     * If the id was registered via singleton() and has already been resolved,
-     * the cached instance is returned without rebuilding the object graph.
+     * If the id was registered via singleton() (or the resolved concrete
+     * class is marked #[Singleton]) and has already been resolved, the
+     * cached instance is returned without rebuilding the object graph.
      *
      * @template T of object
      * @param class-string<T> $id
@@ -130,7 +136,7 @@ final class Container implements ContainerInterface
                 $object = $this->instantiate($concrete);
             }
 
-            if (isset($this->shared[$id])) {
+            if ($this->isShared($id, $concrete)) {
                 $this->instances[$id] = $object;
             }
 
@@ -163,6 +169,27 @@ final class Container implements ContainerInterface
     {
         unset($this->resolving[$id]);
         array_pop($this->resolutionChain);
+    }
+
+    /**
+     * Whether the given id should be cached: either registered explicitly via
+     * singleton(), or the resolved concrete class is marked #[Singleton].
+     */
+    private function isShared(string $id, string $concrete): bool
+    {
+        return isset($this->shared[$id]) || $this->hasSingletonAttribute($concrete);
+    }
+
+    /**
+     * Whether the concrete class declares #[Singleton].
+     */
+    private function hasSingletonAttribute(string $concrete): bool
+    {
+        if (!class_exists($concrete)) {
+            return false;
+        }
+
+        return (new ReflectionClass($concrete))->getAttributes(Singleton::class) !== [];
     }
 
     /**
@@ -233,6 +260,11 @@ final class Container implements ContainerInterface
         }
 
         if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
+            $injected = $this->resolveInjectTarget($param, $type->getName());
+            if ($injected !== null) {
+                return $this->get($injected);
+            }
+
             if (!$type->allowsNull()) {
                 return $this->get($type->getName());
             }
@@ -279,6 +311,26 @@ final class Container implements ContainerInterface
             $param->getName(),
             sprintf('It has type "%s" and no member of it could be resolved.', (string) $type),
         );
+    }
+
+    /**
+     * Returns the class-string a parameter must resolve to via #[Inject], or
+     * null when no attribute applies or an explicit binding for the parameter
+     * type takes precedence.
+     */
+    private function resolveInjectTarget(ReflectionParameter $param, string $typeName): ?string
+    {
+        if (isset($this->bindings[$typeName])) {
+            return null;
+        }
+
+        $attributes = $param->getAttributes(Inject::class);
+
+        if ($attributes === []) {
+            return null;
+        }
+
+        return $attributes[0]->newInstance()->concrete;
     }
 
     /**

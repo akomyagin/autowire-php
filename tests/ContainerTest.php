@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace AutowirePHP\Tests;
 
+use AutowirePHP\Attribute\Inject;
+use AutowirePHP\Attribute\Singleton;
 use AutowirePHP\Container;
 use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
@@ -745,6 +747,102 @@ final class ContainerTest extends TestCase
             self::assertNotInstanceOf(NotFoundExceptionInterface::class, $exception);
         }
     }
+
+    public function testInjectAttributeResolvesConcreteForAmbiguousInterface(): void
+    {
+        $container = new Container();
+
+        $n = $container->get(NeedsInjectedImpl::class);
+
+        self::assertInstanceOf(StripeGateway::class, $n->gw);
+    }
+
+    public function testExplicitBindOverridesInjectAttribute(): void
+    {
+        $container = new Container();
+        $container->bind(PaymentGateway::class, PaypalGateway::class);
+
+        $n = $container->get(NeedsInjectedImpl::class);
+
+        self::assertInstanceOf(PaypalGateway::class, $n->gw);
+    }
+
+    public function testSingletonAttributeSharesInstanceWhenResolvedByClass(): void
+    {
+        $container = new Container();
+
+        $a = $container->get(AttrSingleton::class);
+        $b = $container->get(AttrSingleton::class);
+
+        self::assertSame($a, $b);
+    }
+
+    public function testSingletonAttributeThroughInterfaceBindingCachesUnderRequestId(): void
+    {
+        $container = new Container();
+        $container->bind(AttrSharedInterface::class, AttrSharedImpl::class);
+
+        $a1 = $container->get(AttrSharedInterface::class);
+        $a2 = $container->get(AttrSharedInterface::class);
+        $direct = $container->get(AttrSharedImpl::class);
+
+        self::assertSame($a1, $a2);
+        self::assertNotSame($a1, $direct);
+    }
+
+    public function testExplicitSingletonAndSingletonAttributeAgreeWithoutConflict(): void
+    {
+        $container = new Container();
+        $container->singleton(AttrSingleton::class);
+
+        $a = $container->get(AttrSingleton::class);
+        $b = $container->get(AttrSingleton::class);
+
+        self::assertSame($a, $b);
+    }
+
+    public function testClassWithoutAttributesResolvesAsBefore(): void
+    {
+        $container = new Container();
+
+        $a = $container->get(GraphA::class);
+        $b = $container->get(GraphA::class);
+
+        self::assertNotSame($a, $b);
+    }
+
+    public function testDetectsCycleThroughInjectAttribute(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(InjectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chain = $exception->getChain();
+
+            self::assertContains(InjectCycleA::class, $chain);
+            self::assertContains(InjectCycleB::class, $chain);
+        }
+    }
+
+    public function testResolutionStackEmptyAfterInjectResolution(): void
+    {
+        $container = new Container();
+
+        $container->get(NeedsInjectedImpl::class);
+
+        $reflection = new ReflectionObject($container);
+
+        $resolving = $reflection->getProperty('resolving');
+        $resolving->setAccessible(true);
+
+        $resolutionChain = $reflection->getProperty('resolutionChain');
+        $resolutionChain->setAccessible(true);
+
+        self::assertSame([], $resolving->getValue($container));
+        self::assertSame([], $resolutionChain->getValue($container));
+    }
 }
 
 // Fixture classes for the resolution scenarios above. Kept in the same file so
@@ -1104,5 +1202,59 @@ final class NeedsNullableUnion
 {
     public function __construct(public readonly UPrimary|USecondary|null $svc)
     {
+    }
+}
+
+interface PaymentGateway
+{
+}
+
+final class StripeGateway implements PaymentGateway
+{
+}
+
+final class PaypalGateway implements PaymentGateway
+{
+}
+
+final class NeedsInjectedImpl
+{
+    public function __construct(
+        #[Inject(StripeGateway::class)] public readonly PaymentGateway $gw,
+    ) {
+    }
+}
+
+#[Singleton]
+final class AttrSingleton
+{
+}
+
+interface AttrSharedInterface
+{
+}
+
+#[Singleton]
+final class AttrSharedImpl implements AttrSharedInterface
+{
+}
+
+interface InjectCycleMarker
+{
+}
+
+final class InjectCycleA implements InjectCycleMarker
+{
+    public function __construct(
+        #[Inject(InjectCycleB::class)] public readonly InjectCycleMarker $b,
+    ) {
+    }
+}
+
+final class InjectCycleB implements InjectCycleMarker
+{
+    public function __construct(
+        #[Inject(InjectCycleA::class)] public readonly InjectCycleMarker $a,
+    ) {
     }
 }
