@@ -40,6 +40,20 @@ final class Container
     private array $resolutionChain = [];
 
     /**
+     * Ids registered as shared (singleton) via singleton().
+     *
+     * @var array<string, true>
+     */
+    private array $shared = [];
+
+    /**
+     * Resolved shared instances, keyed by the id under which they were requested.
+     *
+     * @var array<string, object>
+     */
+    private array $instances = [];
+
+    /**
      * Register an explicit binding from an abstract id (usually an interface)
      * to a concrete implementation class.
      *
@@ -52,7 +66,28 @@ final class Container
     }
 
     /**
+     * Register an id as shared: the first resolved instance is cached and
+     * returned on every subsequent get() for the same id. The cache is keyed
+     * by $abstract, so requesting $concrete directly (bypassing $abstract)
+     * yields a separate, non-shared instance.
+     *
+     * @param class-string $abstract
+     * @param class-string|null $concrete
+     */
+    public function singleton(string $abstract, ?string $concrete = null): void
+    {
+        if ($concrete !== null) {
+            $this->bind($abstract, $concrete);
+        }
+
+        $this->shared[$abstract] = true;
+    }
+
+    /**
      * Resolve an instance for the given class-string id.
+     *
+     * If the id was registered via singleton() and has already been resolved,
+     * the cached instance is returned without rebuilding the object graph.
      *
      * @template T of object
      * @param class-string<T> $id
@@ -64,6 +99,10 @@ final class Container
      */
     public function get(string $id): object
     {
+        if (isset($this->instances[$id])) {
+            return $this->instances[$id];
+        }
+
         $this->enter($id);
 
         try {
@@ -77,13 +116,19 @@ final class Container
                 $this->enter($concrete);
 
                 try {
-                    return $this->instantiate($concrete);
+                    $object = $this->instantiate($concrete);
                 } finally {
                     $this->leave($concrete);
                 }
+            } else {
+                $object = $this->instantiate($concrete);
             }
 
-            return $this->instantiate($concrete);
+            if (isset($this->shared[$id])) {
+                $this->instances[$id] = $object;
+            }
+
+            return $object;
         } finally {
             $this->leave($id);
         }
