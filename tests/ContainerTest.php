@@ -11,6 +11,9 @@ use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
 use PHPUnit\Framework\TestCase;
+use Psr\Container\ContainerExceptionInterface;
+use Psr\Container\ContainerInterface;
+use Psr\Container\NotFoundExceptionInterface;
 use ReflectionObject;
 use stdClass;
 
@@ -672,6 +675,75 @@ final class ContainerTest extends TestCase
 
         self::assertSame([], $resolving->getValue($container));
         self::assertSame([], $resolutionChain->getValue($container));
+    }
+
+    public function testContainerImplementsPsr11ContainerInterface(): void
+    {
+        self::assertInstanceOf(ContainerInterface::class, new Container());
+    }
+
+    public function testResolvesThroughPsr11ContainerInterfaceType(): void
+    {
+        $container = new Container();
+        $container->bind(FooInterface::class, Foo::class);
+
+        /** @var ContainerInterface $psr11 */
+        $psr11 = $container;
+
+        self::assertTrue($psr11->has(FooInterface::class));
+        self::assertInstanceOf(Foo::class, $psr11->get(FooInterface::class));
+    }
+
+    public function testNotFoundExceptionImplementsPsr11NotFoundExceptionInterface(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get('This\\Class\\Does\\Not\\Exist');
+            self::fail('Expected NotFoundException was not thrown.');
+        } catch (NotFoundException $exception) {
+            self::assertInstanceOf(NotFoundExceptionInterface::class, $exception);
+            self::assertInstanceOf(ContainerExceptionInterface::class, $exception);
+        }
+    }
+
+    public function testNotInstantiableExceptionIsPsr11ContainerExceptionButNotNotFound(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(AbstractThing::class);
+            self::fail('Expected NotInstantiableException was not thrown.');
+        } catch (NotInstantiableException $exception) {
+            self::assertInstanceOf(ContainerExceptionInterface::class, $exception);
+            self::assertNotInstanceOf(NotFoundExceptionInterface::class, $exception);
+        }
+    }
+
+    public function testCircularDependencyExceptionIsPsr11ContainerExceptionButNotNotFound(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(DirectCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            self::assertInstanceOf(ContainerExceptionInterface::class, $exception);
+            self::assertNotInstanceOf(NotFoundExceptionInterface::class, $exception);
+        }
+    }
+
+    public function testUnresolvableParameterExceptionIsPsr11ContainerExceptionButNotNotFound(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->get(NeedsBuiltinNoDefault::class);
+            self::fail('Expected UnresolvableParameterException was not thrown.');
+        } catch (UnresolvableParameterException $exception) {
+            self::assertInstanceOf(ContainerExceptionInterface::class, $exception);
+            self::assertNotInstanceOf(NotFoundExceptionInterface::class, $exception);
+        }
     }
 }
 

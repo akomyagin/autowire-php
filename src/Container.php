@@ -9,6 +9,7 @@ use AutowirePHP\Exception\ContainerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
+use Psr\Container\ContainerInterface;
 use ReflectionClass;
 use ReflectionNamedType;
 use ReflectionParameter;
@@ -18,8 +19,9 @@ use ReflectionUnionType;
  * Framework-agnostic dependency injection container.
  *
  * Resolves object graphs through the PHP Reflection API.
+ * Implements PSR-11 `ContainerInterface`.
  */
-final class Container
+final class Container implements ContainerInterface
 {
     /**
      * Explicit interface/abstract -> concrete class bindings.
