@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace AutowirePHP;
 
 use AutowirePHP\Exception\CircularDependencyException;
+use AutowirePHP\Exception\ContainerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
+use AutowirePHP\Exception\UnresolvableParameterException;
 use ReflectionClass;
 use ReflectionNamedType;
 use ReflectionParameter;
+use ReflectionUnionType;
 
 /**
  * Framework-agnostic dependency injection container.
@@ -95,6 +98,7 @@ final class Container
      *
      * @throws NotFoundException when the id is neither a binding nor an existing type.
      * @throws NotInstantiableException when the resolved type cannot be instantiated.
+     * @throws UnresolvableParameterException when a constructor parameter cannot be autowired.
      * @throws CircularDependencyException when the id is already on the current resolution path.
      */
     public function get(string $id): object
@@ -198,6 +202,10 @@ final class Container
         $args = [];
 
         foreach ($constructor->getParameters() as $param) {
+            if ($param->isVariadic()) {
+                break;
+            }
+
             $args[] = $this->resolveParameter($param, $reflection->getName());
         }
 
@@ -205,17 +213,39 @@ final class Container
     }
 
     /**
-     * Resolve a single constructor parameter: class/interface types are resolved
-     * recursively through the container, otherwise the default value is used.
+     * Resolve a single constructor parameter. Resolution priority: class type
+     * through the container -> union members in order -> default value -> null
+     * (if nullable) -> UnresolvableParameterException.
      *
-     * @throws NotInstantiableException when the parameter cannot be autowired.
+     * A CircularDependencyException is never swallowed while probing nullable
+     * or union members: it always propagates to the caller.
+     *
+     * @throws UnresolvableParameterException when the parameter cannot be autowired.
      */
     private function resolveParameter(ReflectionParameter $param, string $declaringClass): mixed
     {
         $type = $param->getType();
 
+        if ($type instanceof ReflectionUnionType) {
+            return $this->resolveUnionParameter($type, $param, $declaringClass);
+        }
+
         if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
-            return $this->get($type->getName());
+            if (!$type->allowsNull()) {
+                return $this->get($type->getName());
+            }
+
+            try {
+                return $this->get($type->getName());
+            } catch (CircularDependencyException $exception) {
+                throw $exception;
+            } catch (ContainerException) {
+                if ($param->isDefaultValueAvailable()) {
+                    return $param->getDefaultValue();
+                }
+
+                return null;
+            }
         }
 
         if ($param->isDefaultValueAvailable()) {
@@ -223,30 +253,70 @@ final class Container
         }
 
         if ($type === null) {
-            throw new NotInstantiableException(
+            throw new UnresolvableParameterException(
                 $declaringClass,
-                sprintf('Constructor parameter "$%s" has no type hint and cannot be autowired.', $param->getName()),
+                $param->getName(),
+                'It has no type hint and no default value.',
             );
+        }
+
+        if ($param->allowsNull()) {
+            return null;
         }
 
         if ($type instanceof ReflectionNamedType) {
-            throw new NotInstantiableException(
+            throw new UnresolvableParameterException(
                 $declaringClass,
-                sprintf(
-                    'Constructor parameter "$%s" is of built-in type "%s" and cannot be autowired.',
-                    $param->getName(),
-                    $type->getName(),
-                ),
+                $param->getName(),
+                sprintf('It is of built-in type "%s" and has no default value.', $type->getName()),
             );
         }
 
-        throw new NotInstantiableException(
+        throw new UnresolvableParameterException(
             $declaringClass,
-            sprintf(
-                'Constructor parameter "$%s" has type "%s" and cannot be autowired.',
-                $param->getName(),
-                (string) $type,
-            ),
+            $param->getName(),
+            sprintf('It has type "%s" and no member of it could be resolved.', (string) $type),
+        );
+    }
+
+    /**
+     * Resolve a union-typed constructor parameter by trying each class member
+     * in declaration order, then falling back to the default value or null.
+     *
+     * @throws UnresolvableParameterException when no union member can be
+     *         resolved and there is no default value or null fallback.
+     */
+    private function resolveUnionParameter(
+        ReflectionUnionType $type,
+        ReflectionParameter $param,
+        string $declaringClass,
+    ): mixed {
+        foreach ($type->getTypes() as $member) {
+            if (!$member instanceof ReflectionNamedType || $member->isBuiltin()) {
+                continue;
+            }
+
+            try {
+                return $this->get($member->getName());
+            } catch (CircularDependencyException $exception) {
+                throw $exception;
+            } catch (ContainerException) {
+                continue;
+            }
+        }
+
+        if ($param->isDefaultValueAvailable()) {
+            return $param->getDefaultValue();
+        }
+
+        if ($param->allowsNull()) {
+            return null;
+        }
+
+        throw new UnresolvableParameterException(
+            $declaringClass,
+            $param->getName(),
+            sprintf('It has type "%s" and no member of it could be resolved.', (string) $type),
         );
     }
 

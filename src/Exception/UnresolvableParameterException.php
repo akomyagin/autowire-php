@@ -8,18 +8,23 @@ use RuntimeException;
 use Throwable;
 
 /**
- * Thrown when the resolved type exists but cannot be instantiated: an
- * interface without a binding, an abstract class, or a private/protected
- * constructor.
+ * Thrown when a constructor parameter cannot be autowired: no type hint, a
+ * built-in type without a default value, or a union type with no resolvable
+ * member and no default value.
  */
-final class NotInstantiableException extends RuntimeException implements ContainerException
+final class UnresolvableParameterException extends RuntimeException implements ContainerException
 {
     public function __construct(
         private readonly string $className,
+        private readonly string $parameterName,
         private readonly string $reason = '',
         ?Throwable $previous = null,
     ) {
-        $message = sprintf('Class "%s" is not instantiable.', $className);
+        $message = sprintf(
+            'Constructor parameter "$%s" of class "%s" cannot be resolved.',
+            $parameterName,
+            $className,
+        );
 
         if ($reason !== '') {
             $message .= ' ' . $reason;
@@ -31,6 +36,11 @@ final class NotInstantiableException extends RuntimeException implements Contain
     public function getClassName(): string
     {
         return $this->className;
+    }
+
+    public function getParameterName(): string
+    {
+        return $this->parameterName;
     }
 
     public function getReason(): string
