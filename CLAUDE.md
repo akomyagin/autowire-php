@@ -34,10 +34,12 @@ Learning-проект, **первый на чистом PHP** во всём по
 composer install          # установка зависимостей
 composer test             # прогон PHPUnit (алиас на phpunit)
 vendor/bin/phpunit        # то же напрямую
+composer lint             # проверка PSR-12 через php-cs-fixer, файлы не меняются
+composer lint:fix         # автоисправление стиля
 php -l src/Container.php   # быстрая проверка синтаксиса отдельного файла
 ```
 
-Перед коммитом: `composer test` должен быть зелёным.
+Перед коммитом: `composer test` и `composer lint` должны быть зелёными.
 
 ## Конвенции
 
