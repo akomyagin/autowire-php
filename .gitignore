@@ -3,6 +3,7 @@
 .DS_Store
 .phpunit.result.cache
 /.phpunit.cache/
+/.php-cs-fixer.cache
 /.idea/
 /docs/
 /.claude/
