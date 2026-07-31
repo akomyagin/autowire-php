@@ -16,8 +16,12 @@ use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\ContainerInterface;
 use Psr\Container\NotFoundExceptionInterface;
+use Psr\Log\AbstractLogger;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
 use ReflectionObject;
 use stdClass;
+use Stringable;
 
 final class ContainerTest extends TestCase
 {
@@ -843,6 +847,303 @@ final class ContainerTest extends TestCase
         self::assertSame([], $resolving->getValue($container));
         self::assertSame([], $resolutionChain->getValue($container));
     }
+
+    public function testLogsResolutionRequest(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+
+        $container->get(NoConstructor::class);
+
+        $record = self::singleRecordMatching($logger, 'Resolving {id}');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame(NoConstructor::class, $record['context']['id']);
+        self::assertSame(0, $record['context']['depth']);
+    }
+
+    public function testLogsSharedInstanceCacheHit(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->singleton(SharedService::class);
+
+        $container->get(SharedService::class);
+        $container->get(SharedService::class);
+
+        $record = self::singleRecordMatching($logger, 'from cache');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame(SharedService::class, $record['context']['id']);
+        self::assertSame(0, $record['context']['depth']);
+
+        // A cache hit must still announce the request: the guarantee is that
+        // every get() is visible in the log, not just the ones that build.
+        self::assertCount(2, self::recordsMatching($logger, 'Resolving {id}'));
+    }
+
+    public function testLogsBindingApplication(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->bind(FooInterface::class, Foo::class);
+
+        $container->get(FooInterface::class);
+
+        $record = self::singleRecordMatching($logger, 'Binding applied');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame(FooInterface::class, $record['context']['id']);
+        self::assertSame(Foo::class, $record['context']['concrete']);
+        self::assertSame(0, $record['context']['depth']);
+    }
+
+    public function testLogsInjectAttributeApplication(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+
+        $container->get(NeedsInjectedImpl::class);
+
+        $record = self::singleRecordMatching($logger, 'Inject attribute applied');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame('gw', $record['context']['parameter']);
+        self::assertSame(NeedsInjectedImpl::class, $record['context']['class']);
+        self::assertSame(StripeGateway::class, $record['context']['target']);
+        self::assertSame(1, $record['context']['depth']);
+    }
+
+    public function testLogsSharedCachingReasonForSingletonMethod(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->singleton(SharedService::class);
+
+        $container->get(SharedService::class);
+
+        $record = self::singleRecordMatching($logger, 'Caching shared instance');
+
+        self::assertSame(SharedService::class, $record['context']['id']);
+        self::assertSame('singleton()', $record['context']['reason']);
+        self::assertSame(0, $record['context']['depth']);
+    }
+
+    public function testLogsSharedCachingReasonForSingletonAttribute(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+
+        $container->get(AttrSingleton::class);
+
+        $record = self::singleRecordMatching($logger, 'Caching shared instance');
+
+        self::assertSame(AttrSingleton::class, $record['context']['id']);
+        self::assertSame('#[Singleton]', $record['context']['reason']);
+    }
+
+    /**
+     * singleton() and #[Singleton] are an OR, so when both apply the instance is
+     * shared either way and only the reported reason is at stake. singleton() is
+     * checked first deliberately: it short-circuits before hasSingletonAttribute()
+     * builds a ReflectionClass, so the order is a hot-path decision, not cosmetics.
+     */
+    public function testReportsSingletonMethodAsReasonWhenAttributeAlsoApplies(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->singleton(AttrSingleton::class);
+
+        $container->get(AttrSingleton::class);
+
+        $record = self::singleRecordMatching($logger, 'Caching shared instance');
+
+        self::assertSame('singleton()', $record['context']['reason']);
+    }
+
+    public function testLogsCircularDependencyChain(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+
+        try {
+            $container->get(ConcreteCycleA::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException) {
+            // The record, not the exception, is what this test is about.
+        }
+
+        $record = self::singleRecordMatching($logger, 'Circular dependency detected');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame(ConcreteCycleA::class, $record['context']['id']);
+
+        $chain = $record['context']['chain'];
+
+        self::assertStringContainsString(ConcreteCycleA::class, $chain);
+        self::assertStringContainsString(ConcreteCycleB::class, $chain);
+        self::assertStringContainsString(ConcreteCycleC::class, $chain);
+        self::assertStringContainsString(' -> ', $chain);
+
+        // depth is the level the repeated id would have occupied, so the chain,
+        // which already includes that id, is exactly one entry longer.
+        self::assertCount($record['context']['depth'] + 1, explode(' -> ', $chain));
+    }
+
+    public function testLogsResolutionDepthForNestedGraph(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+
+        $container->get(GraphA::class);
+
+        $depths = [];
+
+        foreach (self::recordsMatching($logger, 'Resolving {id}') as $record) {
+            $depths[$record['context']['id']] = $record['context']['depth'];
+        }
+
+        self::assertSame(0, $depths[GraphA::class]);
+        self::assertSame(1, $depths[GraphB::class]);
+        self::assertSame(1, $depths[GraphC::class]);
+        self::assertSame(2, $depths[GraphD::class]);
+    }
+
+    public function testAllLogRecordsUseDebugLevel(): void
+    {
+        $logger = self::exerciseEveryLoggedEvent();
+
+        self::assertNotSame([], $logger->records);
+
+        foreach ($logger->records as $record) {
+            self::assertSame(LogLevel::DEBUG, $record['level'], $record['message']);
+        }
+    }
+
+    public function testEveryLogPlaceholderHasMatchingContextKey(): void
+    {
+        $logger = self::exerciseEveryLoggedEvent();
+
+        self::assertNotSame([], $logger->records);
+
+        foreach ($logger->records as $record) {
+            preg_match_all('/\{([A-Za-z0-9_]+)\}/', $record['message'], $matches);
+
+            self::assertNotSame([], $matches[1], sprintf('Message "%s" has no placeholder.', $record['message']));
+
+            foreach ($matches[1] as $placeholder) {
+                self::assertArrayHasKey(
+                    $placeholder,
+                    $record['context'],
+                    sprintf('Placeholder {%s} of "%s" has no context key.', $placeholder, $record['message']),
+                );
+            }
+        }
+    }
+
+    /**
+     * The logger parameter is nullable on purpose. A non-nullable class-typed
+     * constructor parameter is resolved through get() before any default value
+     * is considered, so `= new NullLogger()` would make the container unable to
+     * autowire itself or anything depending on it — LoggerInterface has no
+     * binding and is not instantiable. Nullable falls back to null instead.
+     */
+    public function testContainerStillAutowiresItselfAndItsDependents(): void
+    {
+        $container = new Container();
+
+        self::assertInstanceOf(Container::class, $container->get(Container::class));
+        self::assertInstanceOf(NeedsContainer::class, $container->get(NeedsContainer::class));
+    }
+
+    public function testExplicitLoggerBindingIsInjectedWhenContainerIsAutowired(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->bind(LoggerInterface::class, SpyLogger::class);
+
+        $resolved = $container->get(NeedsContainer::class);
+
+        // The outer container's own logger is not propagated: the nested one is
+        // autowired from the binding, like any other dependency.
+        self::assertInstanceOf(Container::class, $resolved->container);
+    }
+
+    public function testContainerWithoutLoggerBehavesAsBefore(): void
+    {
+        $container = new Container();
+        $container->bind(FooInterface::class, Foo::class);
+        $container->singleton(SharedService::class);
+
+        self::assertInstanceOf(Foo::class, $container->get(FooInterface::class));
+        self::assertInstanceOf(GraphA::class, $container->get(GraphA::class));
+        self::assertSame($container->get(SharedService::class), $container->get(SharedService::class));
+        self::assertNotSame($container->get(GraphC::class), $container->get(GraphC::class));
+
+        $this->expectException(CircularDependencyException::class);
+
+        $container->get(ConcreteCycleA::class);
+    }
+
+    /**
+     * Drive one container through every kind of event the container logs, so
+     * cross-cutting assertions cover all message shapes at once.
+     */
+    private static function exerciseEveryLoggedEvent(): SpyLogger
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->bind(FooInterface::class, Foo::class);
+        $container->singleton(SharedService::class);
+
+        $container->get(FooInterface::class);
+        $container->get(SharedService::class);
+        $container->get(SharedService::class);
+        $container->get(AttrSingleton::class);
+        $container->get(NeedsInjectedImpl::class);
+
+        try {
+            $container->get(ConcreteCycleA::class);
+        } catch (CircularDependencyException) {
+            // Expected: the cycle record is part of the set under test.
+        }
+
+        // Without this the helper silently stops being exhaustive as soon as a
+        // seventh log point is added, and the cross-cutting tests above would
+        // keep passing while no longer covering everything they claim to.
+        $shapes = array_unique(array_column($logger->records, 'message'));
+
+        self::assertCount(
+            6,
+            $shapes,
+            'The helper must exercise every log point; update it when adding one.',
+        );
+
+        return $logger;
+    }
+
+    /**
+     * @return list<array{level: mixed, message: string, context: array<string, mixed>}>
+     */
+    private static function recordsMatching(SpyLogger $logger, string $needle): array
+    {
+        return array_values(array_filter(
+            $logger->records,
+            static fn (array $record): bool => str_contains($record['message'], $needle),
+        ));
+    }
+
+    /**
+     * @return array{level: mixed, message: string, context: array<string, mixed>}
+     */
+    private static function singleRecordMatching(SpyLogger $logger, string $needle): array
+    {
+        $matches = self::recordsMatching($logger, $needle);
+
+        self::assertCount(1, $matches, sprintf('Expected exactly one record matching "%s".', $needle));
+
+        return $matches[0];
+    }
 }
 
 // Fixture classes for the resolution scenarios above. Kept in the same file so
@@ -1256,5 +1557,41 @@ final class InjectCycleB implements InjectCycleMarker
     public function __construct(
         #[Inject(InjectCycleA::class)] public readonly InjectCycleMarker $a,
     ) {
+    }
+}
+
+/**
+ * PSR-3 logger that records every call instead of writing anywhere, so tests
+ * can assert on levels, messages and context. AbstractLogger supplies the
+ * level-named shortcuts, leaving only log() to implement.
+ */
+/**
+ * Service-locator style consumer: exists to prove the container can still be
+ * autowired as somebody else's dependency after gaining a constructor.
+ */
+final class NeedsContainer
+{
+    public function __construct(public Container $container)
+    {
+    }
+}
+
+final class SpyLogger extends AbstractLogger
+{
+    /**
+     * @var list<array{level: mixed, message: string, context: array<string, mixed>}>
+     */
+    public array $records = [];
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    public function log(mixed $level, string|Stringable $message, array $context = []): void
+    {
+        $this->records[] = [
+            'level' => $level,
+            'message' => (string) $message,
+            'context' => $context,
+        ];
     }
 }

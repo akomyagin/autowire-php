@@ -12,6 +12,8 @@ use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
 use Psr\Container\ContainerInterface;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use ReflectionClass;
 use ReflectionNamedType;
 use ReflectionParameter;
@@ -22,6 +24,16 @@ use ReflectionUnionType;
  *
  * Resolves object graphs through the PHP Reflection API.
  * Implements PSR-11 `ContainerInterface`.
+ *
+ * Resolution steps are reported to an optional PSR-3 logger at `debug` level.
+ * Failures are not logged separately: they are already reported by throwing,
+ * so logging them again would only duplicate noise.
+ *
+ * Context arrays are built unconditionally, without guarding on whether the
+ * logger discards them. The cost is one array per resolution step and nothing
+ * else — messages are literals, no sprintf, no Reflection, and the only
+ * implode() sits on the path to a throw — so the guard would buy less than it
+ * costs in readability for a library whose point is legible mechanics.
  */
 final class Container implements ContainerInterface
 {
@@ -59,6 +71,23 @@ final class Container implements ContainerInterface
      * @var array<string, object>
      */
     private array $instances = [];
+
+    private readonly LoggerInterface $logger;
+
+    /**
+     * Without a logger the container behaves exactly as it did before logging
+     * existed: NullLogger discards every record and nothing else observes them.
+     *
+     * The parameter is nullable rather than defaulting to `new NullLogger()`
+     * so that the container keeps autowiring itself. A non-nullable class-typed
+     * parameter is resolved through get(), which would fail on the unbindable
+     * LoggerInterface before any default value is considered; a nullable one
+     * falls back to null, and null is normalised to NullLogger here.
+     */
+    public function __construct(?LoggerInterface $logger = null)
+    {
+        $this->logger = $logger ?? new NullLogger();
+    }
 
     /**
      * Register an explicit binding from an abstract id (usually an interface)
@@ -111,7 +140,19 @@ final class Container implements ContainerInterface
      */
     public function get(string $id): object
     {
+        // Captured before enter() pushes $id, so every record of this call
+        // reports the nesting level of $id itself rather than the size of the
+        // resolution path at the moment the record happened to be written.
+        $depth = $this->depth();
+
+        $this->logger->debug('Resolving {id}', ['id' => $id, 'depth' => $depth]);
+
         if (isset($this->instances[$id])) {
+            $this->logger->debug(
+                'Returning shared instance for {id} from cache',
+                ['id' => $id, 'depth' => $depth],
+            );
+
             return $this->instances[$id];
         }
 
@@ -119,6 +160,16 @@ final class Container implements ContainerInterface
 
         try {
             $concrete = $this->bindings[$id] ?? $id;
+
+            // Logged before the existence check on purpose: when a binding
+            // points at a missing class, seeing which binding was applied is
+            // exactly what makes the following NotFoundException diagnosable.
+            if (isset($this->bindings[$id])) {
+                $this->logger->debug(
+                    'Binding applied: {id} -> {concrete}',
+                    ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
+                );
+            }
 
             if (!class_exists($concrete) && !interface_exists($concrete)) {
                 throw new NotFoundException($concrete);
@@ -136,8 +187,15 @@ final class Container implements ContainerInterface
                 $object = $this->instantiate($concrete);
             }
 
-            if ($this->isShared($id, $concrete)) {
+            $sharedReason = $this->sharedReason($id, $concrete);
+
+            if ($sharedReason !== null) {
                 $this->instances[$id] = $object;
+
+                $this->logger->debug(
+                    'Caching shared instance for {id} (reason: {reason})',
+                    ['id' => $id, 'reason' => $sharedReason, 'depth' => $depth],
+                );
             }
 
             return $object;
@@ -155,6 +213,12 @@ final class Container implements ContainerInterface
     {
         if (isset($this->resolving[$id])) {
             $chain = [...$this->resolutionChain, $id];
+
+            $this->logger->debug(
+                'Circular dependency detected: {chain}',
+                ['id' => $id, 'chain' => implode(' -> ', $chain), 'depth' => $this->depth()],
+            );
+
             throw new CircularDependencyException($chain);
         }
 
@@ -172,12 +236,38 @@ final class Container implements ContainerInterface
     }
 
     /**
-     * Whether the given id should be cached: either registered explicitly via
-     * singleton(), or the resolved concrete class is marked #[Singleton].
+     * Zero-based nesting level at which the id being resolved sits, reported in
+     * every log record so that nesting can be read off the log without parsing
+     * the chain. A top-level get() reports 0, its dependencies 1, and so on.
+     *
+     * Called before the id is pushed onto the path, so the cycle record reports
+     * the level the repeated id would have occupied; its chain, which already
+     * includes that id, therefore holds `depth + 1` entries.
      */
-    private function isShared(string $id, string $concrete): bool
+    private function depth(): int
     {
-        return isset($this->shared[$id]) || $this->hasSingletonAttribute($concrete);
+        return count($this->resolutionChain);
+    }
+
+    /**
+     * Why the given id should be cached, or null when it should not be:
+     * either it was registered explicitly via singleton(), or the resolved
+     * concrete class is marked #[Singleton]. When both apply, singleton()
+     * is reported, mirroring the short-circuit order of the original check.
+     *
+     * @return 'singleton()'|'#[Singleton]'|null
+     */
+    private function sharedReason(string $id, string $concrete): ?string
+    {
+        if (isset($this->shared[$id])) {
+            return 'singleton()';
+        }
+
+        if ($this->hasSingletonAttribute($concrete)) {
+            return '#[Singleton]';
+        }
+
+        return null;
     }
 
     /**
@@ -262,6 +352,19 @@ final class Container implements ContainerInterface
         if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
             $injected = $this->resolveInjectTarget($param, $type->getName());
             if ($injected !== null) {
+                $this->logger->debug(
+                    // The attribute target may itself be an abstraction that the
+                    // following get() re-resolves through bindings, so it is not
+                    // the same notion as the `concrete` of a binding record.
+                    'Inject attribute applied to parameter ${parameter} of {class}: resolving as {target}',
+                    [
+                        'parameter' => $param->getName(),
+                        'class' => $declaringClass,
+                        'target' => $injected,
+                        'depth' => $this->depth(),
+                    ],
+                );
+
                 return $this->get($injected);
             }
 
