@@ -6,18 +6,25 @@ namespace AutowirePHP;
 
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Event\ContainerEvent;
+use AutowirePHP\Event\ResolutionFailed;
+use AutowirePHP\Event\ResolutionRequested;
+use AutowirePHP\Event\ServiceResolved;
 use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
+use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
 use Psr\Container\ContainerInterface;
+use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use ReflectionClass;
 use ReflectionNamedType;
 use ReflectionParameter;
 use ReflectionUnionType;
+use Throwable;
 
 /**
  * Framework-agnostic dependency injection container.
@@ -34,6 +41,29 @@ use ReflectionUnionType;
  * else — messages are literals, no sprintf, no Reflection, and the only
  * implode() sits on the path to a throw — so the guard would buy less than it
  * costs in readability for a library whose point is legible mechanics.
+ *
+ * The resolution lifecycle is additionally observable through an optional
+ * PSR-14 event dispatcher: every get() frame dispatches a ResolutionRequested
+ * and then exactly one terminal ServiceResolved or ResolutionFailed with the
+ * same id and depth. The events are read-only — a listener can watch resolution
+ * but cannot substitute an instance, touch the shared instance cache or affect
+ * cycle detection.
+ *
+ * A listener that throws never rewrites the outcome of resolution. On the
+ * success path its failure surfaces as ListenerException, which deliberately
+ * carries no ContainerException marker so that no enclosing parameter probe can
+ * absorb it. On the failure path the original resolution exception wins and
+ * reaches the caller unchanged, while the listener failure is reported to the
+ * log — otherwise a broken listener could downgrade a circular dependency into
+ * a silently null dependency.
+ *
+ * Re-entrancy: ResolutionRequested is dispatched before enter() and the
+ * terminal events after leave(), so a listener of a top-level frame may call
+ * get() for the same id again. Nested frames are different: the ids of the
+ * enclosing frames are still on the resolution path, so requesting one of them
+ * from a listener raises CircularDependencyException. Re-entering the container
+ * from a listener is therefore not supported, and the container does not guard
+ * against it beyond the ordinary cycle detection.
  */
 final class Container implements ContainerInterface
 {
@@ -83,9 +113,20 @@ final class Container implements ContainerInterface
      * parameter is resolved through get(), which would fail on the unbindable
      * LoggerInterface before any default value is considered; a nullable one
      * falls back to null, and null is normalised to NullLogger here.
+     *
+     * The dispatcher is nullable for exactly the same reason — a non-nullable
+     * EventDispatcherInterface parameter would be sent through get() and fail
+     * on that unbindable interface. Unlike the logger it is not normalised:
+     * PSR-14 ships no null implementation, and `$this->dispatcher?->dispatch(
+     * new ...)` short-circuits the whole expression, so with no dispatcher not
+     * even the event object is allocated. Both parameters are optional and the
+     * dispatcher was added last, so `new Container()` and
+     * `new Container($logger)` keep working unchanged.
      */
-    public function __construct(?LoggerInterface $logger = null)
-    {
+    public function __construct(
+        ?LoggerInterface $logger = null,
+        private readonly ?EventDispatcherInterface $dispatcher = null,
+    ) {
         $this->logger = $logger ?? new NullLogger();
     }
 
@@ -147,60 +188,142 @@ final class Container implements ContainerInterface
 
         $this->logger->debug('Resolving {id}', ['id' => $id, 'depth' => $depth]);
 
+        // Dispatched before the cache check so that every request is observed:
+        // otherwise request counts would lie and the pairing with a terminal
+        // event would not hold for cache hits.
+        $this->dispatch(new ResolutionRequested($id, $depth));
+
         if (isset($this->instances[$id])) {
             $this->logger->debug(
                 'Returning shared instance for {id} from cache',
                 ['id' => $id, 'depth' => $depth],
             );
 
+            $this->dispatch(
+                new ServiceResolved($id, $depth, $this->instances[$id], fromCache: true),
+            );
+
             return $this->instances[$id];
         }
 
-        $this->enter($id);
+        // enter() sits inside the try so that a cycle closing on $id itself is
+        // reported as a failure of this frame too; without it the pairing of
+        // ResolutionRequested with a terminal event would break. leave() is
+        // still guaranteed by the inner finally and the exception still leaves
+        // the frame as the same instance.
+        try {
+            $this->enter($id);
+
+            try {
+                $concrete = $this->bindings[$id] ?? $id;
+
+                // Logged before the existence check on purpose: when a binding
+                // points at a missing class, seeing which binding was applied is
+                // exactly what makes the following NotFoundException diagnosable.
+                if (isset($this->bindings[$id])) {
+                    $this->logger->debug(
+                        'Binding applied: {id} -> {concrete}',
+                        ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
+                    );
+                }
+
+                if (!class_exists($concrete) && !interface_exists($concrete)) {
+                    throw new NotFoundException($concrete);
+                }
+
+                if ($concrete !== $id) {
+                    $this->enter($concrete);
+
+                    try {
+                        $object = $this->instantiate($concrete);
+                    } finally {
+                        $this->leave($concrete);
+                    }
+                } else {
+                    $object = $this->instantiate($concrete);
+                }
+
+                $sharedReason = $this->sharedReason($id, $concrete);
+
+                if ($sharedReason !== null) {
+                    $this->instances[$id] = $object;
+
+                    $this->logger->debug(
+                        'Caching shared instance for {id} (reason: {reason})',
+                        ['id' => $id, 'reason' => $sharedReason, 'depth' => $depth],
+                    );
+                }
+            } finally {
+                $this->leave($id);
+            }
+        } catch (Throwable $exception) {
+            $this->dispatchAfterFailure(new ResolutionFailed($id, $depth, $exception), $exception);
+
+            throw $exception;
+        }
+
+        // Dispatched outside the try so that a listener failure does not produce
+        // a spurious ResolutionFailed — terminal events describe the work of the
+        // container, not the behaviour of listeners.
+        $this->dispatch(new ServiceResolved($id, $depth, $object, fromCache: false));
+
+        return $object;
+    }
+
+    /**
+     * Dispatch an event, translating a listener failure into ListenerException.
+     *
+     * The translation is what keeps a broken listener from rewriting the outcome
+     * of resolution. A listener throwing something that carries the local
+     * ContainerException marker would otherwise be indistinguishable from a
+     * genuine resolution failure, and an enclosing nullable or union parameter
+     * probe would absorb it and substitute null — silently producing an object
+     * graph with missing dependencies. ListenerException carries no such marker,
+     * so it always reaches the caller.
+     *
+     * @throws ListenerException when a listener throws.
+     */
+    private function dispatch(ContainerEvent $event): void
+    {
+        if ($this->dispatcher === null) {
+            return;
+        }
 
         try {
-            $concrete = $this->bindings[$id] ?? $id;
+            $this->dispatcher->dispatch($event);
+        } catch (Throwable $listenerFailure) {
+            throw new ListenerException($event, $listenerFailure);
+        }
+    }
 
-            // Logged before the existence check on purpose: when a binding
-            // points at a missing class, seeing which binding was applied is
-            // exactly what makes the following NotFoundException diagnosable.
-            if (isset($this->bindings[$id])) {
-                $this->logger->debug(
-                    'Binding applied: {id} -> {concrete}',
-                    ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
-                );
-            }
+    /**
+     * Dispatch a terminal event on the failure path, where a resolution
+     * exception is already in flight.
+     *
+     * Here the listener failure must not be thrown: the diagnosis of why
+     * resolution failed is the more useful of the two, and callers — including
+     * the container's own parameter probes — are entitled to receive the
+     * original exception instance unchanged. The listener failure would be lost
+     * entirely, so it goes to the log, which is the only channel left.
+     */
+    private function dispatchAfterFailure(ContainerEvent $event, Throwable $resolutionFailure): void
+    {
+        if ($this->dispatcher === null) {
+            return;
+        }
 
-            if (!class_exists($concrete) && !interface_exists($concrete)) {
-                throw new NotFoundException($concrete);
-            }
-
-            if ($concrete !== $id) {
-                $this->enter($concrete);
-
-                try {
-                    $object = $this->instantiate($concrete);
-                } finally {
-                    $this->leave($concrete);
-                }
-            } else {
-                $object = $this->instantiate($concrete);
-            }
-
-            $sharedReason = $this->sharedReason($id, $concrete);
-
-            if ($sharedReason !== null) {
-                $this->instances[$id] = $object;
-
-                $this->logger->debug(
-                    'Caching shared instance for {id} (reason: {reason})',
-                    ['id' => $id, 'reason' => $sharedReason, 'depth' => $depth],
-                );
-            }
-
-            return $object;
-        } finally {
-            $this->leave($id);
+        try {
+            $this->dispatcher->dispatch($event);
+        } catch (Throwable $listenerFailure) {
+            $this->logger->debug(
+                'Listener of {event} threw {class} and was suppressed in favour of {failure}',
+                [
+                    'event' => $event::class,
+                    'class' => $listenerFailure::class,
+                    'failure' => $resolutionFailure::class,
+                    'listenerFailure' => $listenerFailure,
+                ],
+            );
         }
     }
 

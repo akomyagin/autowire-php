@@ -7,8 +7,13 @@ namespace AutowirePHP\Tests;
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
 use AutowirePHP\Container;
+use AutowirePHP\Event\ContainerEvent;
+use AutowirePHP\Event\ResolutionFailed;
+use AutowirePHP\Event\ResolutionRequested;
+use AutowirePHP\Event\ServiceResolved;
 use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
+use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
@@ -16,12 +21,15 @@ use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\ContainerInterface;
 use Psr\Container\NotFoundExceptionInterface;
+use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\AbstractLogger;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
 use ReflectionObject;
+use RuntimeException;
 use stdClass;
 use Stringable;
+use Throwable;
 
 final class ContainerTest extends TestCase
 {
@@ -1109,8 +1117,10 @@ final class ContainerTest extends TestCase
         }
 
         // Without this the helper silently stops being exhaustive as soon as a
-        // seventh log point is added, and the cross-cutting tests above would
-        // keep passing while no longer covering everything they claim to.
+        // log point is added, and the cross-cutting tests above would keep
+        // passing while no longer covering everything they claim to. The count
+        // covers the resolution log points only: the listener-suppression
+        // record needs a dispatcher, which this helper deliberately omits.
         $shapes = array_unique(array_column($logger->records, 'message'));
 
         self::assertCount(
@@ -1143,6 +1153,396 @@ final class ContainerTest extends TestCase
         self::assertCount(1, $matches, sprintf('Expected exactly one record matching "%s".', $needle));
 
         return $matches[0];
+    }
+
+    /**
+     * The marker is the hook a type-based listener provider subscribes to, so
+     * dropping it from any event would silently unsubscribe such a listener.
+     */
+    public function testEveryDispatchedEventImplementsTheContainerEventMarker(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $container->get(GraphA::class);
+
+        try {
+            $container->get(ConcreteCycleA::class);
+        } catch (CircularDependencyException) {
+            // Expected: failure events belong to the set under test.
+        }
+
+        self::assertNotSame([], $events->events);
+
+        foreach ($events->events as $event) {
+            self::assertInstanceOf(ContainerEvent::class, $event);
+        }
+    }
+
+    public function testDispatchesResolutionRequestedForEveryGetIncludingNested(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $container->get(GraphA::class);
+
+        $requested = self::eventsOf($events, ResolutionRequested::class);
+
+        // Order matters as much as the count: the outer frame is announced
+        // before its dependencies, which is what makes the stream readable as
+        // a resolution tree.
+        self::assertSame(
+            [
+                [GraphA::class, 0],
+                [GraphB::class, 1],
+                [GraphD::class, 2],
+                [GraphC::class, 1],
+            ],
+            array_map(
+                static fn (ResolutionRequested $event): array => [$event->id, $event->depth],
+                $requested,
+            ),
+        );
+    }
+
+    public function testDispatchesServiceResolvedWithBuiltInstance(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $instance = $container->get(GraphB::class);
+
+        $resolved = self::eventsOf($events, ServiceResolved::class);
+
+        // The nested frame finishes first, so the requested id closes the list.
+        self::assertCount(2, $resolved);
+        self::assertSame(GraphD::class, $resolved[0]->id);
+
+        self::assertSame(GraphB::class, $resolved[1]->id);
+        self::assertSame(0, $resolved[1]->depth);
+        self::assertSame($instance, $resolved[1]->instance);
+        self::assertFalse($resolved[1]->fromCache);
+    }
+
+    public function testDispatchesServiceResolvedFromCacheOnSharedHit(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+        $container->singleton(SharedService::class);
+
+        $first = $container->get(SharedService::class);
+        $second = $container->get(SharedService::class);
+
+        self::assertCount(2, self::eventsOf($events, ResolutionRequested::class));
+
+        $resolved = self::eventsOf($events, ServiceResolved::class);
+
+        self::assertCount(2, $resolved);
+        self::assertFalse($resolved[0]->fromCache);
+        self::assertSame($first, $resolved[0]->instance);
+        self::assertTrue($resolved[1]->fromCache);
+        self::assertSame($second, $resolved[1]->instance);
+        self::assertSame($first, $second);
+
+        $built = array_filter(
+            $resolved,
+            static fn (ServiceResolved $event): bool => !$event->fromCache,
+        );
+
+        self::assertCount(1, $built, 'A shared id must be reported as built exactly once.');
+    }
+
+    /**
+     * The pairing invariant is the whole point of the events: it is what the
+     * log cannot give, and what request counters, resolution trees and timing
+     * spans are built on.
+     */
+    public function testEveryResolutionRequestedGetsExactlyOneTerminalEvent(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+        $container->bind(FooInterface::class, Foo::class);
+        $container->singleton(SharedService::class);
+
+        $container->get(GraphA::class);
+        $container->get(NeedsFoo::class);
+        $container->get(SharedService::class);
+        $container->get(SharedService::class);
+
+        try {
+            $container->get(ConcreteCycleA::class);
+        } catch (CircularDependencyException) {
+            // Expected: the failing frames belong to the set under test.
+        }
+
+        $requested = self::eventsOf($events, ResolutionRequested::class);
+        $resolved = self::eventsOf($events, ServiceResolved::class);
+        $failed = self::eventsOf($events, ResolutionFailed::class);
+
+        self::assertCount(count($resolved) + count($failed), $requested);
+        self::assertSame(
+            self::tallyByIdAndDepth($requested),
+            self::tallyByIdAndDepth([...$resolved, ...$failed]),
+        );
+    }
+
+    public function testDispatchesResolutionFailedOnCircularDependencyPerFrame(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $caught = null;
+
+        try {
+            $container->get(ConcreteCycleA::class);
+        } catch (CircularDependencyException $exception) {
+            $caught = $exception;
+        }
+
+        self::assertInstanceOf(CircularDependencyException::class, $caught);
+
+        $failed = self::eventsOf($events, ResolutionFailed::class);
+
+        // One event per active frame, innermost first: the depth decreases as
+        // the stack unwinds.
+        self::assertSame(
+            [
+                [ConcreteCycleA::class, 3],
+                [ConcreteCycleC::class, 2],
+                [ConcreteCycleB::class, 1],
+                [ConcreteCycleA::class, 0],
+            ],
+            array_map(
+                static fn (ResolutionFailed $event): array => [$event->id, $event->depth],
+                $failed,
+            ),
+        );
+
+        foreach ($failed as $event) {
+            self::assertSame($caught, $event->exception);
+        }
+
+        self::assertSame([], self::eventsOf($events, ServiceResolved::class));
+    }
+
+    public function testDispatchesResolutionFailedOnNotFound(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        try {
+            $container->get('AutowirePHP\Tests\NoSuchService');
+        } catch (NotFoundException) {
+            // Expected: the throw is what the event reports.
+        }
+
+        $failed = self::eventsOf($events, ResolutionFailed::class);
+
+        self::assertCount(1, $failed);
+        self::assertSame('AutowirePHP\Tests\NoSuchService', $failed[0]->id);
+        self::assertSame(0, $failed[0]->depth);
+        self::assertInstanceOf(NotFoundException::class, $failed[0]->exception);
+    }
+
+    /**
+     * A failed frame does not imply a failed call: the nullable probe really
+     * did fail for BarInterface, and the parent frame then chose the fallback.
+     */
+    public function testDispatchesResolutionFailedForRecoveredNullableProbe(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $instance = $container->get(NeedsNullableBar::class);
+
+        self::assertNull($instance->bar);
+
+        $failed = self::eventsOf($events, ResolutionFailed::class);
+
+        self::assertCount(1, $failed);
+        self::assertSame(BarInterface::class, $failed[0]->id);
+        self::assertSame(1, $failed[0]->depth);
+        self::assertInstanceOf(NotInstantiableException::class, $failed[0]->exception);
+
+        $resolved = self::eventsOf($events, ServiceResolved::class);
+
+        self::assertCount(1, $resolved);
+        self::assertSame(NeedsNullableBar::class, $resolved[0]->id);
+        self::assertSame(0, $resolved[0]->depth);
+        self::assertSame($instance, $resolved[0]->instance);
+    }
+
+    public function testListenerFailureSurfacesAsListenerException(): void
+    {
+        $container = new Container(null, new ThrowingDispatcher(
+            static fn (): Throwable => new RuntimeException('listener is broken'),
+        ));
+
+        try {
+            $container->get(NoConstructor::class);
+
+            self::fail('Expected the listener failure to reach the caller.');
+        } catch (ListenerException $exception) {
+            self::assertInstanceOf(ResolutionRequested::class, $exception->getEvent());
+            self::assertInstanceOf(RuntimeException::class, $exception->getPrevious());
+            self::assertSame('listener is broken', $exception->getPrevious()->getMessage());
+        }
+    }
+
+    /**
+     * The success event is dispatched outside the frame's try/catch on purpose.
+     * Were it inside, a listener failure would be caught as if the container had
+     * failed, and the frame would report both success and failure.
+     */
+    public function testFailingSuccessListenerDoesNotProduceAFailureEvent(): void
+    {
+        $dispatcher = new ThrowingDispatcher(
+            static fn (object $event): ?Throwable => $event instanceof ServiceResolved
+                ? new RuntimeException('listener is broken')
+                : null,
+        );
+        $container = new Container(null, $dispatcher);
+
+        try {
+            $container->get(NoConstructor::class);
+
+            self::fail('Expected the listener failure to reach the caller.');
+        } catch (ListenerException) {
+            // Expected: what matters is which events were dispatched.
+        }
+
+        self::assertSame([], self::eventsOf($dispatcher, ResolutionFailed::class));
+    }
+
+    /**
+     * ListenerException must not carry the ContainerException marker, or the
+     * nullable probe of an enclosing frame would absorb it and hand back null.
+     */
+    public function testListenerExceptionIsNotAbsorbedByNullableProbe(): void
+    {
+        $container = new Container(null, new ThrowingDispatcher(
+            static fn (object $event): ?Throwable => $event instanceof ResolutionRequested
+                && $event->id === BarInterface::class
+                    ? new RuntimeException('listener is broken')
+                    : null,
+        ));
+
+        self::assertNotInstanceOf(ContainerException::class, new ListenerException(
+            new ResolutionRequested(BarInterface::class, 0),
+            new RuntimeException(),
+        ));
+
+        $this->expectException(ListenerException::class);
+
+        $container->get(NeedsNullableBar::class);
+    }
+
+    /**
+     * The regression this guards: a listener throwing a ContainerException
+     * subclass used to replace the in-flight exception, after which the parent's
+     * nullable probe swallowed it and returned an object with a null dependency
+     * instead of reporting the cycle.
+     */
+    public function testListenerFailureNeverSuppressesTheResolutionFailure(): void
+    {
+        $container = new Container(null, new ThrowingDispatcher(
+            static fn (object $event): ?Throwable => $event instanceof ResolutionFailed
+                ? new NotFoundException('Unrelated')
+                : null,
+        ));
+        $container->bind(CycleThroughNullable::class, NullableCycleImpl::class);
+
+        $this->expectException(CircularDependencyException::class);
+
+        $container->get(CycleThroughNullable::class);
+    }
+
+    public function testServiceResolvedListenerCanReenterContainerAtTopLevel(): void
+    {
+        $events = new ReenteringDispatcher();
+        $container = new Container(null, $events);
+        $events->container = $container;
+
+        // Terminal events are dispatched after leave(), so the id is no longer
+        // on the resolution path and a top-level listener may ask for it again.
+        $instance = $container->get(NoConstructor::class);
+
+        self::assertInstanceOf(NoConstructor::class, $instance);
+        self::assertTrue($events->reentered);
+        self::assertInstanceOf(NoConstructor::class, $events->reenteredInstance);
+        self::assertNotSame($instance, $events->reenteredInstance);
+    }
+
+    /**
+     * Mirror of testContainerWithoutLoggerBehavesAsBefore: with no dispatcher
+     * the nullsafe dispatch short-circuits and nothing about resolution changes.
+     */
+    public function testContainerWithoutDispatcherBehavesAsBefore(): void
+    {
+        foreach ([new Container(), new Container(new SpyLogger())] as $container) {
+            $container->bind(FooInterface::class, Foo::class);
+            $container->singleton(SharedService::class);
+
+            self::assertInstanceOf(Foo::class, $container->get(FooInterface::class));
+            self::assertInstanceOf(GraphA::class, $container->get(GraphA::class));
+            self::assertSame($container->get(SharedService::class), $container->get(SharedService::class));
+            self::assertNotSame($container->get(GraphC::class), $container->get(GraphC::class));
+
+            try {
+                $container->get(ConcreteCycleA::class);
+
+                self::fail('Expected a CircularDependencyException without a dispatcher.');
+            } catch (CircularDependencyException) {
+                // Expected: cycle detection is untouched by the events.
+            }
+        }
+    }
+
+    public function testEventsAndLogRecordsCoexistOnOneResolution(): void
+    {
+        $logger = new SpyLogger();
+        $events = new SpyEventDispatcher();
+        $container = new Container($logger, $events);
+
+        $container->get(GraphB::class);
+
+        self::assertCount(2, self::recordsMatching($logger, 'Resolving {id}'));
+        self::assertCount(2, self::eventsOf($events, ResolutionRequested::class));
+        self::assertCount(2, self::eventsOf($events, ServiceResolved::class));
+    }
+
+    /**
+     * @template TEvent of object
+     * @param class-string<TEvent> $class
+     * @return list<TEvent>
+     */
+    private static function eventsOf(SpyEventDispatcher|ThrowingDispatcher $dispatcher, string $class): array
+    {
+        return array_values(array_filter(
+            $dispatcher->events,
+            static fn (object $event): bool => $event instanceof $class,
+        ));
+    }
+
+    /**
+     * Count events per (id, depth) pair, so requested and terminal events can
+     * be compared as multisets rather than by position.
+     *
+     * @param list<ResolutionRequested|ResolutionFailed|ServiceResolved> $events
+     * @return array<string, int>
+     */
+    private static function tallyByIdAndDepth(array $events): array
+    {
+        $counts = [];
+
+        foreach ($events as $event) {
+            $key = $event->id . '@' . $event->depth;
+            $counts[$key] = ($counts[$key] ?? 0) + 1;
+        }
+
+        ksort($counts);
+
+        return $counts;
     }
 }
 
@@ -1593,5 +1993,103 @@ final class SpyLogger extends AbstractLogger
             'message' => (string) $message,
             'context' => $context,
         ];
+    }
+}
+
+/**
+ * PSR-14 dispatcher that records every event instead of notifying listeners,
+ * so tests can assert on the order, the payloads and the pairing of the
+ * resolution lifecycle.
+ */
+final class SpyEventDispatcher implements EventDispatcherInterface
+{
+    /**
+     * @var list<object>
+     */
+    public array $events = [];
+
+    public function dispatch(object $event): object
+    {
+        $this->events[] = $event;
+
+        return $event;
+    }
+}
+
+/**
+ * Dispatcher whose "listener" calls back into the container on the first
+ * successful top-level resolution. The guard flag keeps that from recursing
+ * forever, since the re-entrant get() dispatches its own events.
+ */
+interface CycleThroughNullable
+{
+}
+
+/**
+ * Closes a cycle through its own interface on a nullable parameter, so the
+ * cycle is reported from a frame whose parent is willing to fall back to null.
+ */
+final class NullableCycleImpl implements CycleThroughNullable
+{
+    public function __construct(public ?CycleThroughNullable $next = null)
+    {
+    }
+}
+
+/**
+ * Dispatcher whose listener throws whatever the given factory returns, so a
+ * test can pick exactly which event misbehaves.
+ */
+final class ThrowingDispatcher implements EventDispatcherInterface
+{
+    /**
+     * Every event reaching the dispatcher, recorded before it may throw.
+     *
+     * @var list<object>
+     */
+    public array $events = [];
+
+    /**
+     * @param callable(object): ?Throwable $failure
+     */
+    public function __construct(private $failure)
+    {
+    }
+
+    public function dispatch(object $event): object
+    {
+        $this->events[] = $event;
+
+        $throwable = ($this->failure)($event);
+
+        if ($throwable !== null) {
+            throw $throwable;
+        }
+
+        return $event;
+    }
+}
+
+final class ReenteringDispatcher implements EventDispatcherInterface
+{
+    public ?Container $container = null;
+
+    public bool $reentered = false;
+
+    public ?object $reenteredInstance = null;
+
+    public function dispatch(object $event): object
+    {
+        if (
+            $event instanceof ServiceResolved
+            && !$event->fromCache
+            && !$this->reentered
+            && $this->container !== null
+        ) {
+            $this->reentered = true;
+            $this->reenteredInstance = $this->container->get($event->id);
+        }
+
+        return $event;
     }
 }
