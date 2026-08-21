@@ -242,7 +242,10 @@ final class Container implements ContainerInterface
         }
 
         $this->shared[$abstract] = true;
-        $this->flushPlans();
+
+        if ($concrete === null) {
+            $this->flushPlans();
+        }
     }
 
     /**
