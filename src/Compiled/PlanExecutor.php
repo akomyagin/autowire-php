@@ -8,6 +8,7 @@ use AutowirePHP\Container;
 use AutowirePHP\Exception\CircularDependencyException;
 use AutowirePHP\Exception\ContainerException;
 use Closure;
+use LogicException;
 use Psr\Log\LoggerInterface;
 use ReflectionParameter;
 use Throwable;
@@ -135,8 +136,11 @@ final class PlanExecutor
             case CompiledPlan::SPEC_NULL:
                 return null;
 
-            default:
+            case CompiledPlan::SPEC_FAIL:
                 throw self::exception($spec['exception']);
+
+            default:
+                throw new LogicException(sprintf('Unknown compiled argument spec kind "%s".', $spec['kind']));
         }
     }
 
