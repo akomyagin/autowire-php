@@ -6,6 +6,10 @@ namespace AutowirePHP;
 
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Cache\PlanCache;
+use AutowirePHP\Compiled\CompiledPlan;
+use AutowirePHP\Compiled\PlanCompiler;
+use AutowirePHP\Compiled\PlanExecutor;
 use AutowirePHP\Event\ContainerEvent;
 use AutowirePHP\Event\ResolutionFailed;
 use AutowirePHP\Event\ResolutionRequested;
@@ -16,10 +20,12 @@ use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
+use Psr\Cache\CacheItemPoolInterface;
 use Psr\Container\ContainerInterface;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+use Psr\SimpleCache\CacheInterface;
 use ReflectionClass;
 use ReflectionNamedType;
 use ReflectionParameter;
@@ -64,6 +70,21 @@ use Throwable;
  * from a listener raises CircularDependencyException. Re-entering the container
  * from a listener is therefore not supported, and the container does not guard
  * against it beyond the ordinary cycle detection.
+ *
+ * Passing a PSR-6 pool or PSR-16 cache as the third constructor argument
+ * enables the compiled mode: the graph is walked with reflection once, the
+ * resulting resolution plan is stored in the cache, and subsequent get() calls
+ * build objects by interpreting the plan without re-walking the graph through
+ * reflection (deferred default values are the one deliberate exception — the
+ * plan carries parameter references and the executor evaluates them at the
+ * same moment the runtime path would).
+ * The compiled path replaces exactly one section of the mechanics — the
+ * instantiate() -> build() -> resolveParameter() chain — and recurses through
+ * this very get(), so everything observable (exceptions, events, log records,
+ * depth accounting, shared instances) is produced by the same code as the
+ * runtime path. The only additions are debug records about the plan cache
+ * itself. Plans are invalidated by a hash of the bindings/shared maps and a
+ * manifest of the class files that took part in compilation.
  */
 final class Container implements ContainerInterface
 {
@@ -105,6 +126,49 @@ final class Container implements ContainerInterface
     private readonly LoggerInterface $logger;
 
     /**
+     * Plan cache adapter; null means the compiled mode is off and the
+     * container resolves through runtime reflection only.
+     */
+    private readonly ?PlanCache $planCache;
+
+    /**
+     * Interpreter for compiled plan nodes; created together with the cache.
+     */
+    private readonly ?PlanExecutor $planExecutor;
+
+    /**
+     * In-memory merge of the node maps of every plan loaded or compiled so
+     * far, keyed by id. A get() for an id already present here never goes back
+     * to the cache. Flushed by bind()/singleton() — see flushPlans().
+     *
+     * @var array<string, array<string, mixed>>
+     */
+    private array $planNodes = [];
+
+    /**
+     * Ids whose plan preparation already failed once in this process, so that
+     * it is attempted once per id rather than on every top-level get().
+     *
+     * Without this, a failing compilation makes the compiled mode slower than
+     * the runtime mode it replaces: the id never gets a node, so the entry
+     * condition in get() sends every subsequent call through a full eager
+     * reflection walk of the graph before degrading again. The failures worth
+     * retrying — a broken cache driver — are already absorbed inside PlanCache;
+     * what reaches preparePlan() is a property of the code, and the code cannot
+     * change under a running process. Flushed by bind()/singleton() together
+     * with the plans, because a changed configuration compiles a different graph.
+     *
+     * @var array<string, true>
+     */
+    private array $unplannable = [];
+
+    /**
+     * Memoised hash of the bindings/shared maps; invalidated on every
+     * registration together with the loaded plans.
+     */
+    private ?string $configHash = null;
+
+    /**
      * Without a logger the container behaves exactly as it did before logging
      * existed: NullLogger discards every record and nothing else observes them.
      *
@@ -119,15 +183,31 @@ final class Container implements ContainerInterface
      * on that unbindable interface. Unlike the logger it is not normalised:
      * PSR-14 ships no null implementation, and `$this->dispatcher?->dispatch(
      * new ...)` short-circuits the whole expression, so with no dispatcher not
-     * even the event object is allocated. Both parameters are optional and the
-     * dispatcher was added last, so `new Container()` and
-     * `new Container($logger)` keep working unchanged.
+     * even the event object is allocated. All three parameters are optional
+     * and each was added last in its turn, so `new Container()`,
+     * `new Container($logger)` and `new Container($logger, $dispatcher)` keep
+     * working unchanged.
+     *
+     * The cache parameter is a union of both PSR cache flavours on purpose:
+     * two separate nullable parameters would create the meaningless "both
+     * passed" state. Passing a cache is the only trigger of the compiled mode
+     * — no extra flag. The `= null` default is mandatory for the same
+     * self-autowiring reason as with the logger: the union type both contains
+     * null and resolves to the default after every member fails, but the
+     * default must exist for that fallback to be reachable. Guarded by
+     * testContainerStillAutowiresItselfAndItsDependents, which has caught this
+     * exact mistake twice.
      */
     public function __construct(
         ?LoggerInterface $logger = null,
         private readonly ?EventDispatcherInterface $dispatcher = null,
+        CacheItemPoolInterface|CacheInterface|null $cache = null,
     ) {
         $this->logger = $logger ?? new NullLogger();
+        $this->planCache = $cache === null ? null : new PlanCache($cache, $this->logger);
+        $this->planExecutor = $cache === null
+            ? null
+            : new PlanExecutor($this, $this->logger, fn (): int => $this->depth());
     }
 
     /**
@@ -141,6 +221,7 @@ final class Container implements ContainerInterface
     public function bind(string $abstract, string $concrete): void
     {
         $this->bindings[$abstract] = $concrete;
+        $this->flushPlans();
     }
 
     /**
@@ -161,6 +242,23 @@ final class Container implements ContainerInterface
         }
 
         $this->shared[$abstract] = true;
+        $this->flushPlans();
+    }
+
+    /**
+     * Drop every plan loaded into memory and the memoised config hash.
+     *
+     * Registrations must do this: a plan compiled before a singleton() call
+     * would keep living in the process with a stale sharedReason. The cache
+     * key of the next compilation changes anyway (the hash covers both maps),
+     * but nothing would notice in memory. $this->instances is deliberately NOT
+     * flushed — bind() never dropped resolved instances and must not start to.
+     */
+    private function flushPlans(): void
+    {
+        $this->planNodes = [];
+        $this->unplannable = [];
+        $this->configHash = null;
     }
 
     /**
@@ -212,6 +310,18 @@ final class Container implements ContainerInterface
         // still guaranteed by the inner finally and the exception still leaves
         // the frame as the same instance.
         try {
+            // In compiled mode, make sure a plan node for this id sits in
+            // memory before the frame does any work: load it from the cache or
+            // compile it now. Placed inside the try so that even an unexpected
+            // failure here keeps the event pairing intact.
+            if (
+                $this->planCache !== null
+                && !isset($this->planNodes[$id])
+                && !isset($this->unplannable[$id])
+            ) {
+                $this->preparePlan($id);
+            }
+
             $this->enter($id);
 
             try {
@@ -231,19 +341,33 @@ final class Container implements ContainerInterface
                     throw new NotFoundException($concrete);
                 }
 
+                // The compiled path replaces exactly the instantiate() call
+                // below and nothing else; a missing node (compiled mode off,
+                // or plan preparation failed) means the runtime path.
+                $node = $this->planNodes[$id] ?? null;
+
                 if ($concrete !== $id) {
                     $this->enter($concrete);
 
                     try {
-                        $object = $this->instantiate($concrete);
+                        $object = $node !== null
+                            ? $this->planExecutor->execute($node)
+                            : $this->instantiate($concrete);
                     } finally {
                         $this->leave($concrete);
                     }
                 } else {
-                    $object = $this->instantiate($concrete);
+                    $object = $node !== null
+                        ? $this->planExecutor->execute($node)
+                        : $this->instantiate($concrete);
                 }
 
-                $sharedReason = $this->sharedReason($id, $concrete);
+                // On the compiled path the shared reason was computed by the
+                // compiler with the same priority; taking it from the node is
+                // what spares the second ReflectionClass of the runtime path.
+                $sharedReason = $node !== null
+                    ? ($node['shared'] ?? null)
+                    : $this->sharedReason($id, $concrete);
 
                 if ($sharedReason !== null) {
                     $this->instances[$id] = $object;
@@ -373,6 +497,102 @@ final class Container implements ContainerInterface
     }
 
     /**
+     * Load the plan for a top-level id from the cache, or compile and store
+     * it. Runs once per unknown id: the node maps of every loaded plan merge
+     * in memory, so a later get() of any id reachable from an earlier root
+     * never comes back here.
+     *
+     * Every outcome is silent towards the caller — a discarded payload, a
+     * stale manifest or a broken driver only produce debug records and a
+     * recompilation. Compilation itself instantiates nothing, dispatches no
+     * events and does not touch the resolution stack.
+     *
+     * The whole body sits under catch (Throwable) because the driver is not
+     * the only layer that can fail: compilation may hit a throwing autoloader
+     * or a malformed attribute, and validation triggers autoloading through
+     * class_exists(). "Discard and recompile — always; throw — never" must
+     * hold for all of them, so any failure here leaves the id without a node
+     * and the frame degrades to the runtime reflection path. The id is also
+     * written off into $unplannable, so the degradation costs one attempt per
+     * id rather than one per get() — see that property.
+     */
+    private function preparePlan(string $id): void
+    {
+        try {
+            $hash = $this->configHash();
+            $key = PlanCache::keyFor($hash, $id);
+            $payload = $this->planCache->fetch($key);
+
+            if ($payload !== null) {
+                $plan = CompiledPlan::fromPayload($payload);
+
+                if ($plan === null || $plan->configHash !== $hash || $plan->root !== $id) {
+                    $this->logger->debug(
+                        'Discarded compiled plan for {id}: {reason}',
+                        [
+                            'id' => $id,
+                            'reason' => 'the payload is malformed, carries a foreign format stamp'
+                                . ' or belongs to another configuration',
+                        ],
+                    );
+                } elseif (($staleness = $plan->staleness()) !== null) {
+                    $this->logger->debug(
+                        'Discarded compiled plan for {id}: {reason}',
+                        ['id' => $id, 'reason' => $staleness],
+                    );
+                } else {
+                    // array_merge(), not +=: a node just validated as fresh
+                    // must win over one an earlier plan already left in memory
+                    // for the same shared id, not lose to it. No observable
+                    // regression today (nodes for one id under one configHash
+                    // are identical either way), but += encodes the opposite
+                    // of that intent.
+                    $this->planNodes = array_merge($this->planNodes, $plan->nodes);
+
+                    $this->logger->debug(
+                        'Loaded compiled plan for {id} from cache',
+                        ['id' => $id, 'key' => $key],
+                    );
+
+                    return;
+                }
+            }
+
+            $plan = (new PlanCompiler($this->bindings, $this->shared))->compile($id, $hash);
+
+            // See the array_merge() note above — same reasoning for a
+            // freshly compiled plan's nodes.
+            $this->planNodes = array_merge($this->planNodes, $plan->nodes);
+
+            $this->logger->debug(
+                'Compiled resolution plan for {id}',
+                ['id' => $id, 'key' => $key],
+            );
+
+            $this->planCache->store($key, $plan->toPayload());
+        } catch (Throwable $failure) {
+            // Written off before the record: the id is unplannable because the
+            // preparation failed, not because the failure was logged.
+            $this->unplannable[$id] = true;
+
+            $this->logger->debug(
+                'Failed to prepare a compiled plan for {id}: {error}',
+                ['id' => $id, 'error' => $failure->getMessage(), 'exception' => $failure],
+            );
+        }
+    }
+
+    /**
+     * Hash of the current bindings/shared maps, memoised until the next
+     * registration. Participates in every cache key, so changing a binding or
+     * registering a singleton can never reuse a plan compiled without it.
+     */
+    private function configHash(): string
+    {
+        return $this->configHash ??= PlanCache::configHash($this->bindings, $this->shared);
+    }
+
+    /**
      * Why the given id should be cached, or null when it should not be:
      * either it was registered explicitly via singleton(), or the resolved
      * concrete class is marked #[Singleton]. When both apply, singleton()
@@ -461,6 +681,10 @@ final class Container implements ContainerInterface
      *
      * A CircularDependencyException is never swallowed while probing nullable
      * or union members: it always propagates to the caller.
+     *
+     * This branch order has a second implementor: PlanCompiler replays it when
+     * classifying parameters for a compiled plan. Any change here must be
+     * mirrored there — the parity harness in CompiledContainerTest guards it.
      *
      * @throws UnresolvableParameterException when the parameter cannot be autowired.
      */
