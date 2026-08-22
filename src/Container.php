@@ -20,6 +20,7 @@ use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
+use Closure;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Container\ContainerInterface;
 use Psr\EventDispatcher\EventDispatcherInterface;
@@ -31,6 +32,7 @@ use ReflectionNamedType;
 use ReflectionParameter;
 use ReflectionUnionType;
 use Throwable;
+use TypeError;
 
 /**
  * Framework-agnostic dependency injection container.
@@ -83,8 +85,14 @@ use Throwable;
  * this very get(), so everything observable (exceptions, events, log records,
  * depth accounting, shared instances) is produced by the same code as the
  * runtime path. The only additions are debug records about the plan cache
- * itself. Plans are invalidated by a hash of the bindings/shared maps and a
- * manifest of the class files that took part in compilation.
+ * itself. Plans are invalidated by a hash of the bindings/shared maps and the
+ * factory ids, and by a manifest of the class files that took part in
+ * compilation.
+ *
+ * An id registered through factory() is resolved by a user closure instead of
+ * reflection, inside the same get() frame and with the same observability;
+ * factory ids are excluded from the compiled mode entirely, because a Closure
+ * cannot be serialised into a plan.
  */
 final class Container implements ContainerInterface
 {
@@ -115,6 +123,18 @@ final class Container implements ContainerInterface
      * @var array<string, true>
      */
     private array $shared = [];
+
+    /**
+     * User factories, keyed by the id they resolve. A registered factory is
+     * the most specific way to build an id: get() checks this map before the
+     * compiled plan, the bindings and autowiring, so none of them apply to a
+     * factory id. Only the keys of this map participate in the config hash —
+     * a Closure cannot be serialised, and the factory body cannot change the
+     * plan of any other id.
+     *
+     * @var array<class-string, Closure>
+     */
+    private array $factories = [];
 
     /**
      * Resolved shared instances, keyed by the id under which they were requested.
@@ -249,6 +269,41 @@ final class Container implements ContainerInterface
     }
 
     /**
+     * Register a user factory for an id: get($abstract) calls the closure
+     * instead of walking the constructor, and hands it this container so the
+     * factory can pull autowired dependencies through $c->get() and mix them
+     * with values the container cannot infer — a DSN, a flag. The factory
+     * takes precedence over bind(), #[Inject] and autowiring for the same id:
+     * resolution never reaches them, so when both a factory and a binding are
+     * registered for one id, the factory wins.
+     *
+     * The closure runs inside the ordinary get() frame, between the same
+     * PSR-14 events and on the same resolution path, so cycle detection,
+     * depth accounting, logging and the shared instance cache all apply
+     * unchanged. Only singleton() can mark a factory id as shared:
+     * #[Singleton] lives on a class, and which class the factory builds is
+     * its own decision. An exception thrown by the factory propagates to the
+     * caller unwrapped, exactly like an exception from a user constructor —
+     * wrapping it in a ContainerException would let an enclosing nullable or
+     * union probe absorb it and silently substitute null.
+     *
+     * A factory id never participates in the compiled mode: a Closure cannot
+     * be serialised into a plan, so the id always resolves through the
+     * runtime factory branch, and — like bind() — the registration flushes
+     * plans already loaded and moves the config hash, so a plan compiled
+     * before it can never be reused. Already resolved shared instances
+     * survive the registration, as they survive bind().
+     *
+     * @param class-string $abstract
+     * @param Closure(Container): object $factory
+     */
+    public function factory(string $abstract, Closure $factory): void
+    {
+        $this->factories[$abstract] = $factory;
+        $this->flushPlans();
+    }
+
+    /**
      * Drop every plan loaded into memory and the memoised config hash.
      *
      * Registrations must do this: a plan compiled before a singleton() call
@@ -316,9 +371,13 @@ final class Container implements ContainerInterface
             // In compiled mode, make sure a plan node for this id sits in
             // memory before the frame does any work: load it from the cache or
             // compile it now. Placed inside the try so that even an unexpected
-            // failure here keeps the event pairing intact.
+            // failure here keeps the event pairing intact. A factory id is
+            // excluded up front: it is unplannable by definition (a Closure
+            // cannot be serialised into a plan), so no compilation attempt is
+            // spent on it and it resolves through the factory branch below.
             if (
                 $this->planCache !== null
+                && !isset($this->factories[$id])
                 && !isset($this->planNodes[$id])
                 && !isset($this->unplannable[$id])
             ) {
@@ -328,49 +387,82 @@ final class Container implements ContainerInterface
             $this->enter($id);
 
             try {
-                $concrete = $this->bindings[$id] ?? $id;
-
-                // Logged before the existence check on purpose: when a binding
-                // points at a missing class, seeing which binding was applied is
-                // exactly what makes the following NotFoundException diagnosable.
-                if (isset($this->bindings[$id])) {
+                if (isset($this->factories[$id])) {
                     $this->logger->debug(
-                        'Binding applied: {id} -> {concrete}',
-                        ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
+                        'Factory invoked for {id}',
+                        ['id' => $id, 'depth' => $depth],
                     );
-                }
 
-                if (!class_exists($concrete) && !interface_exists($concrete)) {
-                    throw new NotFoundException($concrete);
-                }
+                    // The factory takes the place of instantiate(): it runs
+                    // inside this very frame, with $id already on the
+                    // resolution path, so a nested $c->get() inherits depth
+                    // and cycle detection, and a factory exception propagates
+                    // unwrapped like a constructor's. No second enter(): the
+                    // factory decides itself what to build, so $id is the
+                    // only id this frame knows about.
+                    $object = ($this->factories[$id])($this);
 
-                // The compiled path replaces exactly the instantiate() call
-                // below and nothing else; a missing node (compiled mode off,
-                // or plan preparation failed) means the runtime path.
-                $node = $this->planNodes[$id] ?? null;
+                    if (!is_object($object)) {
+                        throw new TypeError(sprintf(
+                            'Factory registered for "%s" must return an object, got %s.',
+                            $id,
+                            get_debug_type($object),
+                        ));
+                    }
 
-                if ($concrete !== $id) {
-                    $this->enter($concrete);
+                    // #[Singleton] lives on a class and the class a factory
+                    // builds is its own decision, so of the two halves of
+                    // sharedReason() only the singleton() registration can
+                    // apply to a factory id.
+                    $sharedReason = isset($this->shared[$id]) ? 'singleton()' : null;
+                } else {
+                    $concrete = $this->bindings[$id] ?? $id;
 
-                    try {
+                    // Logged before the existence check on purpose: when a
+                    // binding points at a missing class, seeing which binding
+                    // was applied is exactly what makes the following
+                    // NotFoundException diagnosable.
+                    if (isset($this->bindings[$id])) {
+                        $this->logger->debug(
+                            'Binding applied: {id} -> {concrete}',
+                            ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
+                        );
+                    }
+
+                    if (!class_exists($concrete) && !interface_exists($concrete)) {
+                        throw new NotFoundException($concrete);
+                    }
+
+                    // The compiled path replaces exactly the instantiate()
+                    // call below and nothing else; a missing node (compiled
+                    // mode off, or plan preparation failed) means the runtime
+                    // path.
+                    $node = $this->planNodes[$id] ?? null;
+
+                    if ($concrete !== $id) {
+                        $this->enter($concrete);
+
+                        try {
+                            $object = $node !== null
+                                ? $this->planExecutor->execute($node)
+                                : $this->instantiate($concrete);
+                        } finally {
+                            $this->leave($concrete);
+                        }
+                    } else {
                         $object = $node !== null
                             ? $this->planExecutor->execute($node)
                             : $this->instantiate($concrete);
-                    } finally {
-                        $this->leave($concrete);
                     }
-                } else {
-                    $object = $node !== null
-                        ? $this->planExecutor->execute($node)
-                        : $this->instantiate($concrete);
-                }
 
-                // On the compiled path the shared reason was computed by the
-                // compiler with the same priority; taking it from the node is
-                // what spares the second ReflectionClass of the runtime path.
-                $sharedReason = $node !== null
-                    ? ($node['shared'] ?? null)
-                    : $this->sharedReason($id, $concrete);
+                    // On the compiled path the shared reason was computed by
+                    // the compiler with the same priority; taking it from the
+                    // node is what spares the second ReflectionClass of the
+                    // runtime path.
+                    $sharedReason = $node !== null
+                        ? ($node['shared'] ?? null)
+                        : $this->sharedReason($id, $concrete);
+                }
 
                 if ($sharedReason !== null) {
                     $this->instances[$id] = $object;
@@ -586,13 +678,20 @@ final class Container implements ContainerInterface
     }
 
     /**
-     * Hash of the current bindings/shared maps, memoised until the next
-     * registration. Participates in every cache key, so changing a binding or
-     * registering a singleton can never reuse a plan compiled without it.
+     * Hash of the current bindings/shared/factories configuration, memoised
+     * until the next registration. Participates in every cache key, so
+     * changing a binding, registering a singleton or registering a factory
+     * can never reuse a plan compiled without it. Of the factories only the
+     * keys are hashed: which ids bypass the plan is configuration, the
+     * closure bodies are not.
      */
     private function configHash(): string
     {
-        return $this->configHash ??= PlanCache::configHash($this->bindings, $this->shared);
+        return $this->configHash ??= PlanCache::configHash(
+            $this->bindings,
+            $this->shared,
+            array_keys($this->factories),
+        );
     }
 
     /**

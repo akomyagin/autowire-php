@@ -43,15 +43,25 @@ final class PlanCache
      * the same cache entry, hence the sort before hashing. The format version
      * participates so that a library upgrade never resurrects an old payload.
      *
+     * Of the factory map only the ids participate: a Closure cannot be
+     * serialised, and the body of a factory cannot change the plan of any
+     * other id — what matters to a plan is solely which ids are resolved by a
+     * factory instead of a compiled node.
+     *
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
+     * @param list<class-string> $factoryIds
      */
-    public static function configHash(array $bindings, array $shared): string
+    public static function configHash(array $bindings, array $shared, array $factoryIds = []): string
     {
         ksort($bindings);
         ksort($shared);
+        sort($factoryIds);
 
-        return hash('sha256', serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared]));
+        return hash(
+            'sha256',
+            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $factoryIds]),
+        );
     }
 
     /**
