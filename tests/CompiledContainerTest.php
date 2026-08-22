@@ -1454,6 +1454,77 @@ final class CompiledContainerTest extends TestCase
         $container->get(CpUnboundInterface::class);
     }
 
+    // -------------------------------------------- lazy proxies (orthogonality)
+
+    /**
+     * Deliberately NOT part of the parity harness: the lazy path has no
+     * three identical runs to compare — lazy() itself dispatches nothing and
+     * the deferred frame is an ordinary get(), which the harness already
+     * covers. These directed tests pin the composition instead: a lazy proxy
+     * over a compiled container builds through the plan without the compiler
+     * knowing anything about laziness.
+     */
+    public function testLazyProxyOnCompiledContainerBuildsThroughPlan(): void
+    {
+        $run = function (CacheInterface|null $cache, string $label): array {
+            CpLazyHeavy::$constructions = 0;
+            $events = new CpSpyDispatcher();
+            $container = new Container(null, $events, $cache);
+
+            $proxy = $container->lazy(CpLazyHeavy::class);
+
+            self::assertSame([], $events->events, $label);
+            self::assertSame(0, CpLazyHeavy::$constructions, $label);
+
+            self::assertInstanceOf(CpLeaf::class, $proxy->leaf, $label);
+            self::assertSame(1, CpLazyHeavy::$constructions, $label);
+
+            return array_map(self::describeEvent(...), $events->events);
+        };
+
+        $reference = $run(null, 'runtime');
+
+        self::assertNotSame([], $reference);
+
+        $cache = new FakeSimpleCache();
+
+        self::assertSame($reference, $run($cache, 'cold'), 'cold: event stream diverged');
+        self::assertSame($reference, $run($cache, 'warm'), 'warm: event stream diverged');
+
+        // The deferred frame went through the plan: the cold run compiled
+        // and stored it once, the warm run loaded it instead of recompiling.
+        self::assertCount(1, $cache->writes);
+        self::assertNotSame([], $cache->reads);
+    }
+
+    public function testLazyDoesNotAffectConfigHashOrInvalidatePlans(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+
+        self::assertInstanceOf(CpLeaf::class, $container->get(CpService::class)->leaf);
+        self::assertCount(1, $cache->writes);
+
+        $reflection = new ReflectionObject($container);
+        $hashBefore = $reflection->getProperty('configHash')->getValue($container);
+        $nodesBefore = $reflection->getProperty('planNodes')->getValue($container);
+
+        self::assertNotNull($hashBefore);
+        self::assertNotSame([], $nodesBefore);
+
+        $proxy = $container->lazy(CpService::class);
+
+        self::assertInstanceOf(CpLeaf::class, $proxy->leaf);
+        self::assertInstanceOf(CpService::class, $container->get(CpService::class));
+
+        // lazy() resolves, it does not register: unlike bind()/singleton()
+        // it must not flush the loaded plans, reset the memoised config hash
+        // or force a recompilation.
+        self::assertSame($hashBefore, $reflection->getProperty('configHash')->getValue($container));
+        self::assertSame($nodesBefore, $reflection->getProperty('planNodes')->getValue($container));
+        self::assertCount(1, $cache->writes);
+    }
+
     // ------------------------------------------------- cache log observability
 
     public function testAllCacheLogRecordsUseDebugLevel(): void
@@ -2167,6 +2238,21 @@ final class CpTagCycleMember
 {
     public function __construct(public readonly CpTaggedCycleConsumer $parent)
     {
+    }
+}
+
+/**
+ * The "heavy" service of the lazy-over-compiled tests: the static counter
+ * shows whether the constructor ran; the CpLeaf dependency gives the plan a
+ * child node to interpret. Reset the counter before reading it.
+ */
+final class CpLazyHeavy
+{
+    public static int $constructions = 0;
+
+    public function __construct(public readonly CpLeaf $leaf)
+    {
+        ++self::$constructions;
     }
 }
 
