@@ -73,10 +73,12 @@ final class PlanCompiler
     /**
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
+     * @param array<class-string, array<class-string, class-string>> $contextual
      */
     public function __construct(
         private readonly array $bindings,
         private readonly array $shared,
+        private readonly array $contextual = [],
     ) {
     }
 
@@ -173,9 +175,16 @@ final class PlanCompiler
 
     /**
      * One-shot replay of the resolveParameter() branch order: union ->
-     * class type (#[Inject] with explicit-binding priority -> non-nullable ->
-     * nullable probe) -> default -> untyped failure -> nullable null ->
-     * builtin failure -> union failure.
+     * class type (contextual binding -> #[Inject] with explicit-binding
+     * priority -> non-nullable -> nullable probe) -> default -> untyped
+     * failure -> nullable null -> builtin failure -> union failure.
+     *
+     * The contextual consumer is $declaringClass — the concrete class being
+     * compiled, exactly the value the runtime path passes into
+     * resolveParameter(); NOT getDeclaringClass() of the constructor. The
+     * manifest (recordManifest()) deliberately differs: it rises to the
+     * declaring class because it answers "which files invalidate the plan",
+     * not "who is the consumer".
      *
      * @return array<string, mixed>
      */
@@ -191,6 +200,18 @@ final class PlanCompiler
 
         if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
             $typeName = $type->getName();
+            $contextual = $this->contextual[$declaringClass][$typeName] ?? null;
+
+            if ($contextual !== null) {
+                $this->compileId($contextual);
+
+                return CompiledPlan::serviceSpec($contextual, null, [
+                    'parameter' => $param->getName(),
+                    'consumer' => $declaringClass,
+                    'target' => $contextual,
+                ]);
+            }
+
             $injected = $this->injectTarget($param, $typeName);
 
             if ($injected !== null) {
@@ -254,6 +275,10 @@ final class PlanCompiler
     }
 
     /**
+     * Neither contextual bindings nor #[Inject] are consulted for a union
+     * member — both are single-target mechanisms, symmetric with
+     * Container::resolveUnionParameter().
+     *
      * @return array<string, mixed>
      */
     private function compileUnionParameter(

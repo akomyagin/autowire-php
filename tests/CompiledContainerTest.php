@@ -8,6 +8,7 @@ use ArrayObject;
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
 use AutowirePHP\Cache\PlanCache;
+use AutowirePHP\Compiled\CompiledPlan;
 use AutowirePHP\Container;
 use AutowirePHP\Event\ResolutionFailed;
 use AutowirePHP\Event\ResolutionRequested;
@@ -48,7 +49,7 @@ use UnitEnum;
 final class CompiledContainerTest extends TestCase
 {
     /**
-     * The six resolution log records plus the listener-suppression record.
+     * The seven resolution log records plus the listener-suppression record.
      * Everything outside this list is about the plan cache itself — the only
      * observability difference the compiled mode is allowed to introduce.
      */
@@ -57,6 +58,7 @@ final class CompiledContainerTest extends TestCase
         'Returning shared instance for {id} from cache',
         'Binding applied: {id} -> {concrete}',
         'Inject attribute applied to parameter ${parameter} of {class}: resolving as {target}',
+        'Contextual binding applied to parameter ${parameter} of {consumer}: resolving as {target}',
         'Caching shared instance for {id} (reason: {reason})',
         'Circular dependency detected: {chain}',
         'Listener of {event} threw {class} and was suppressed in favour of {failure}',
@@ -390,6 +392,153 @@ final class CompiledContainerTest extends TestCase
         $container->singleton(CpLeaf::class);
 
         self::assertSame($container->get(CpLeaf::class), $container->get(CpLeaf::class));
+    }
+
+    // ------------------------------------------------------ contextual binding
+
+    public function testCompiledContextualBindingMatchesRuntime(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->when(CpCtxConsumerOne::class, CpCtxContract::class, CpCtxImplA::class);
+            $container->when(CpCtxConsumerTwo::class, CpCtxContract::class, CpCtxImplB::class);
+        };
+        $scenario = static fn (Container $c): array => [
+            $c->get(CpCtxConsumerOne::class)->dep::class,
+            $c->get(CpCtxConsumerTwo::class)->dep::class,
+        ];
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertSame([CpCtxImplA::class, CpCtxImplB::class], $reference['value']);
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+            self::assertSame($reference['value'], $run['value'], $label . ': structure diverged');
+        }
+    }
+
+    public function testCompiledContextualPrioritiesMatchRuntime(): void
+    {
+        // Context vs the global bind(): wins for the consumer's parameter,
+        // stays inapplicable on the top-level get() of the abstract.
+        $bindConfig = static function (Container $container): void {
+            $container->bind(CpCtxContract::class, CpCtxImplA::class);
+            $container->when(CpCtxConsumerOne::class, CpCtxContract::class, CpCtxImplB::class);
+        };
+        $bindScenario = static fn (Container $c): array => [
+            $c->get(CpCtxConsumerOne::class)->dep::class,
+            $c->get(CpCtxContract::class)::class,
+        ];
+
+        // Context vs #[Inject]: wins on the annotated parameter, while the
+        // attribute keeps winning for a consumer without a context.
+        $injectConfig = static function (Container $container): void {
+            $container->when(CpCtxInjectConsumer::class, CpCtxContract::class, CpCtxImplB::class);
+        };
+        $injectScenario = static fn (Container $c): array => [
+            $c->get(CpCtxInjectConsumer::class)->dep::class,
+            $c->get(CpCtxInjectLoner::class)->dep::class,
+        ];
+
+        $cases = [
+            'context vs bind' => [$bindConfig, $bindScenario, [CpCtxImplB::class, CpCtxImplA::class]],
+            'context vs inject' => [$injectConfig, $injectScenario, [CpCtxImplB::class, CpCtxImplA::class]],
+        ];
+
+        foreach ($cases as $case => [$configure, $scenario, $expected]) {
+            $reference = self::observe(null, $configure, $scenario);
+
+            self::assertSame($expected, $reference['value'], $case);
+
+            $cache = new FakeSimpleCache();
+
+            foreach (['cold', 'warm'] as $label) {
+                $run = self::observe($cache, $configure, $scenario);
+
+                self::assertSame($reference['events'], $run['events'], $case . ', ' . $label . ': events');
+                self::assertSame($reference['log'], $run['log'], $case . ', ' . $label . ': log');
+                self::assertSame($reference['outcome'], $run['outcome'], $case . ', ' . $label . ': outcome');
+                self::assertSame($reference['value'], $run['value'], $case . ', ' . $label . ': structure');
+            }
+        }
+    }
+
+    public function testRegisteringContextualBindingInvalidatesCompiledPlan(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+        $container->bind(CpCtxContract::class, CpCtxImplA::class);
+
+        self::assertInstanceOf(CpCtxImplA::class, $container->get(CpCtxConsumerOne::class)->dep);
+        self::assertCount(1, $cache->writes);
+
+        $container->when(CpCtxConsumerOne::class, CpCtxContract::class, CpCtxImplB::class);
+
+        // The registration flushes the in-memory plans and the changed config
+        // hash lands on a different cache key: the plan compiled without the
+        // context is never reused, neither from memory nor from storage.
+        self::assertInstanceOf(CpCtxImplB::class, $container->get(CpCtxConsumerOne::class)->dep);
+        self::assertCount(2, $cache->writes);
+        self::assertNotSame($cache->writes[0], $cache->writes[1]);
+    }
+
+    public function testCompiledContextualCycleMatchesRuntime(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->when(CpCtxCycleA::class, CpCtxContract::class, CpCtxCycleB::class);
+            $container->when(CpCtxCycleB::class, CpCtxContract::class, CpCtxCycleA::class);
+        };
+        $scenario = static fn (Container $c): object => $c->get(CpCtxCycleA::class);
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertNotNull($reference['outcome']);
+        self::assertSame(CircularDependencyException::class, $reference['outcome'][0]);
+        self::assertStringContainsString(
+            CpCtxCycleA::class . ' -> ' . CpCtxCycleB::class . ' -> ' . CpCtxCycleA::class,
+            $reference['outcome'][1],
+        );
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+        }
+    }
+
+    public function testContextualFormatVersionBumpDiscardsOldPayload(): void
+    {
+        // The contextual feature bumped the format stamp 2 -> 3; a payload
+        // still carrying the previous stamp must be silently recompiled even
+        // if it somehow sits under the current cache key.
+        self::assertSame(3, CompiledPlan::FORMAT_VERSION);
+
+        $cache = new FakeSimpleCache();
+        (new Container(null, null, $cache))->get(CpService::class);
+
+        foreach ($cache->data as $key => $serialized) {
+            $payload = unserialize($serialized);
+            $payload['version'] = 2;
+            $cache->data[$key] = serialize($payload);
+        }
+
+        $writesBefore = count($cache->writes);
+        $logger = new CpSpyLogger();
+        $container = new Container($logger, null, $cache);
+
+        self::assertInstanceOf(CpService::class, $container->get(CpService::class));
+        self::assertGreaterThan($writesBefore, count($cache->writes));
+        self::assertNotSame([], self::recordsMatching($logger, 'Discarded compiled plan'));
     }
 
     // ------------------------------------------------- the cache as storage
@@ -1672,6 +1821,70 @@ final class CpServiceOrCompileGhost
 final class CpServiceOrLateGhost
 {
     public function __construct(public readonly CpService|CpLateGhost $v)
+    {
+    }
+}
+
+// Fixtures for the contextual binding parity scenarios: one contract, two
+// implementations, consumers of every flavour the priority rules distinguish.
+
+interface CpCtxContract
+{
+}
+
+final class CpCtxImplA implements CpCtxContract
+{
+}
+
+final class CpCtxImplB implements CpCtxContract
+{
+}
+
+final class CpCtxConsumerOne
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+final class CpCtxConsumerTwo
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+final class CpCtxInjectConsumer
+{
+    public function __construct(
+        #[Inject(CpCtxImplA::class)] public readonly CpCtxContract $dep,
+    ) {
+    }
+}
+
+/**
+ * Same attribute but no contextual binding is ever registered for this class:
+ * the regression guard that a context registered for another consumer does
+ * not disturb #[Inject].
+ */
+final class CpCtxInjectLoner
+{
+    public function __construct(
+        #[Inject(CpCtxImplA::class)] public readonly CpCtxContract $dep,
+    ) {
+    }
+}
+
+final class CpCtxCycleA implements CpCtxContract
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+final class CpCtxCycleB implements CpCtxContract
+{
+    public function __construct(public readonly CpCtxContract $dep)
     {
     }
 }

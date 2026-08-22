@@ -26,9 +26,10 @@ use Throwable;
  * defaultValue() evaluates it here, at the exact point in control flow where
  * the runtime path would call getDefaultValue() — see that method for why.
  *
- * The single piece of observability replayed by hand is log point 4 (the
- * #[Inject] record), because on the runtime path it lives inside
- * resolveParameter() — the spec carries its data for that reason alone.
+ * The only observability replayed by hand is the pair of parameter-level
+ * debug records — the #[Inject] one and the contextual-binding one — because
+ * on the runtime path they live inside resolveParameter(); the spec carries
+ * their data for that reason alone.
  *
  * @internal Not part of the public API; Container is the only entry point.
  */
@@ -83,6 +84,24 @@ final class PlanExecutor
     {
         switch ($spec['kind']) {
             case CompiledPlan::SPEC_SERVICE:
+                $context = $spec['context'];
+
+                if ($context !== null) {
+                    // The contextual log point, replayed verbatim: message,
+                    // context keys and their order match resolveParameter()
+                    // exactly. Never set together with `inject` — the
+                    // compiler's contextual branch returns first.
+                    $this->logger->debug(
+                        'Contextual binding applied to parameter ${parameter} of {consumer}: resolving as {target}',
+                        [
+                            'parameter' => $context['parameter'],
+                            'consumer' => $context['consumer'],
+                            'target' => $context['target'],
+                            'depth' => ($this->depth)(),
+                        ],
+                    );
+                }
+
                 $inject = $spec['inject'];
 
                 if ($inject !== null) {

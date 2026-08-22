@@ -43,15 +43,31 @@ final class PlanCache
      * the same cache entry, hence the sort before hashing. The format version
      * participates so that a library upgrade never resurrects an old payload.
      *
+     * The contextual map enters the hash whole — consumers, abstracts and
+     * concretes alike — because any of the three changes what a parameter
+     * compiles into. The inner maps are sorted too, so registration order
+     * never influences the hash on that level either.
+     *
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
+     * @param array<class-string, array<class-string, class-string>> $contextual
      */
-    public static function configHash(array $bindings, array $shared): string
+    public static function configHash(array $bindings, array $shared, array $contextual = []): string
     {
         ksort($bindings);
         ksort($shared);
+        ksort($contextual);
 
-        return hash('sha256', serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared]));
+        foreach ($contextual as &$abstractMap) {
+            ksort($abstractMap);
+        }
+
+        unset($abstractMap);
+
+        return hash(
+            'sha256',
+            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $contextual]),
+        );
     }
 
     /**
