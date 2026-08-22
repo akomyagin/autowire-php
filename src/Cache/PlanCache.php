@@ -48,12 +48,22 @@ final class PlanCache
      * compiles into. The inner maps are sorted too, so registration order
      * never influences the hash on that level either.
      *
+     * Of the factory map only the ids participate: a Closure cannot be
+     * serialised, and the body of a factory cannot change the plan of any
+     * other id — what matters to a plan is solely which ids are resolved by a
+     * factory instead of a compiled node.
+     *
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
      * @param array<class-string, array<class-string, class-string>> $contextual
+     * @param list<class-string> $factoryIds
      */
-    public static function configHash(array $bindings, array $shared, array $contextual = []): string
-    {
+    public static function configHash(
+        array $bindings,
+        array $shared,
+        array $contextual = [],
+        array $factoryIds = [],
+    ): string {
         ksort($bindings);
         ksort($shared);
         ksort($contextual);
@@ -64,9 +74,11 @@ final class PlanCache
 
         unset($abstractMap);
 
+        sort($factoryIds);
+
         return hash(
             'sha256',
-            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $contextual]),
+            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $contextual, $factoryIds]),
         );
     }
 
