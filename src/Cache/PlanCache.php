@@ -53,16 +53,23 @@ final class PlanCache
      * other id — what matters to a plan is solely which ids are resolved by a
      * factory instead of a compiled node.
      *
+     * The tag map is sorted by tag name only: the member lists inside keep
+     * their order, because member order is semantic (it is the order of the
+     * injected collection), so two registrations differing only in member
+     * order genuinely are different configurations.
+     *
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
      * @param array<class-string, array<class-string, class-string>> $contextual
      * @param list<class-string> $factoryIds
+     * @param array<string, list<class-string>> $tags
      */
     public static function configHash(
         array $bindings,
         array $shared,
         array $contextual = [],
         array $factoryIds = [],
+        array $tags = [],
     ): string {
         ksort($bindings);
         ksort($shared);
@@ -75,10 +82,11 @@ final class PlanCache
         unset($abstractMap);
 
         sort($factoryIds);
+        ksort($tags);
 
         return hash(
             'sha256',
-            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $contextual, $factoryIds]),
+            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $contextual, $factoryIds, $tags]),
         );
     }
 

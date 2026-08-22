@@ -6,6 +6,7 @@ namespace AutowirePHP\Tests;
 
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Attribute\Tagged;
 use AutowirePHP\Container;
 use AutowirePHP\Event\ContainerEvent;
 use AutowirePHP\Event\ResolutionFailed;
@@ -674,6 +675,139 @@ final class ContainerTest extends TestCase
         self::assertSame([], $n->foos);
     }
 
+    public function testTaggedVariadicReceivesAllTaggedMembers(): void
+    {
+        $container = new Container();
+        $container->tag('handlers', [TagHandlerA::class, TagHandlerB::class, TagHandlerC::class]);
+
+        $consumer = $container->get(NeedsTaggedVariadic::class);
+
+        self::assertCount(3, $consumer->handlers);
+        self::assertContainsOnlyInstancesOf(TagHandler::class, $consumer->handlers);
+        self::assertSame(
+            [TagHandlerA::class, TagHandlerB::class, TagHandlerC::class],
+            array_map(static fn (TagHandler $h): string => $h::class, $consumer->handlers),
+        );
+    }
+
+    public function testTaggedCollectionPreservesRegistrationOrder(): void
+    {
+        $container = new Container();
+        $container->tag('handlers', [TagHandlerB::class]);
+        $container->tag('handlers', [TagHandlerC::class, TagHandlerA::class]);
+
+        $consumer = $container->get(NeedsTaggedVariadic::class);
+
+        // Several tag() calls concatenate in call order; within one call the
+        // array order wins. No sorting of any kind is applied.
+        self::assertSame(
+            [TagHandlerB::class, TagHandlerC::class, TagHandlerA::class],
+            array_map(static fn (TagHandler $h): string => $h::class, $consumer->handlers),
+        );
+    }
+
+    public function testTaggedCollectionDeduplicatesMembers(): void
+    {
+        $container = new Container();
+        $container->tag('handlers', [TagHandlerA::class, TagHandlerB::class]);
+        $container->tag('handlers', [TagHandlerA::class, TagHandlerC::class]);
+
+        $consumer = $container->get(NeedsTaggedVariadic::class);
+
+        // A class registered twice enters the collection once, at the
+        // position of its first occurrence.
+        self::assertSame(
+            [TagHandlerA::class, TagHandlerB::class, TagHandlerC::class],
+            array_map(static fn (TagHandler $h): string => $h::class, $consumer->handlers),
+        );
+    }
+
+    public function testTaggedVariadicWithUnregisteredTagReceivesEmptySet(): void
+    {
+        $container = new Container();
+
+        $consumer = $container->get(NeedsTaggedVariadic::class);
+
+        // Zero members is a legal state of a collection, not an error: the
+        // application simply has no handlers yet.
+        self::assertSame([], $consumer->handlers);
+    }
+
+    public function testUntaggedVariadicStillReceivesEmptySet(): void
+    {
+        $container = new Container();
+        $container->tag('some.other.tag', [TagHandlerA::class]);
+
+        // Registered tags must not leak into a variadic that never asked for
+        // one: the Stage 5 empty-set default is untouched.
+        $n = $container->get(NeedsVariadic::class);
+
+        self::assertSame([], $n->foos);
+    }
+
+    public function testTaggedMemberThatCannotBeBuiltFailsWholeResolution(): void
+    {
+        $container = new Container();
+        $container->tag('handlers', [TagHandlerA::class, TagBrokenHandler::class]);
+
+        // A registered member is a deliberate part of the configuration, so
+        // its failure must surface instead of silently shortening the set.
+        $this->expectException(UnresolvableParameterException::class);
+
+        $container->get(NeedsTaggedVariadic::class);
+    }
+
+    public function testTaggedSingletonMemberIsSharedAcrossConsumers(): void
+    {
+        $container = new Container();
+        $container->tag('handlers', [TagSharedHandler::class, TagHandlerA::class]);
+
+        $first = $container->get(NeedsTaggedVariadic::class);
+        $second = $container->get(NeedsTaggedVariadic::class);
+
+        // Members resolve through ordinary get(), so each keeps its own
+        // lifecycle: the #[Singleton] member is one instance for everybody,
+        // the transient member is fresh per consumer.
+        self::assertSame($first->handlers[0], $second->handlers[0]);
+        self::assertNotSame($first->handlers[1], $second->handlers[1]);
+    }
+
+    public function testCycleThroughTaggedMemberIsDetected(): void
+    {
+        $container = new Container();
+        $container->tag('cycle.handlers', [TagCycleMember::class]);
+
+        try {
+            $container->get(NeedsCycleTagged::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            self::assertSame(
+                [NeedsCycleTagged::class, TagCycleMember::class, NeedsCycleTagged::class],
+                $exception->getChain(),
+            );
+        }
+
+        // The stack must be clean afterwards: a valid graph still resolves.
+        self::assertInstanceOf(Foo::class, $container->get(Foo::class));
+
+        $reflection = new ReflectionObject($container);
+
+        self::assertSame([], $reflection->getProperty('resolving')->getValue($container));
+        self::assertSame([], $reflection->getProperty('resolutionChain')->getValue($container));
+    }
+
+    public function testTaggedAttributeOnNonVariadicParameterIsIgnored(): void
+    {
+        $container = new Container();
+        $container->tag('handlers', [TagHandlerA::class, TagHandlerB::class]);
+
+        // Silently ignored, consistent with #[Inject] outside the class-type
+        // branch: the parameter resolves by its type as if unannotated.
+        $consumer = $container->get(TaggedOnNonVariadic::class);
+
+        self::assertInstanceOf(Foo::class, $consumer->foo);
+    }
+
     public function testResolutionStackIsEmptyAfterNullableFallbackToNull(): void
     {
         $container = new Container();
@@ -923,6 +1057,23 @@ final class ContainerTest extends TestCase
         self::assertSame(1, $record['context']['depth']);
     }
 
+    public function testLogsTaggedCollectionResolution(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->tag('handlers', [TagHandlerA::class, TagHandlerB::class]);
+
+        $container->get(NeedsTaggedVariadic::class);
+
+        $record = self::singleRecordMatching($logger, 'Tagged collection');
+
+        self::assertSame('handlers', $record['context']['parameter']);
+        self::assertSame(NeedsTaggedVariadic::class, $record['context']['class']);
+        self::assertSame('handlers', $record['context']['tag']);
+        self::assertSame(2, $record['context']['count']);
+        self::assertSame(1, $record['context']['depth']);
+    }
+
     public function testLogsSharedCachingReasonForSingletonMethod(): void
     {
         $logger = new SpyLogger();
@@ -1116,6 +1267,9 @@ final class ContainerTest extends TestCase
         $container->get(CtxConsumerOne::class);
         $container->get(NoConstructor::class);
 
+        $container->tag('handlers', [TagHandlerA::class]);
+        $container->get(NeedsTaggedVariadic::class);
+
         try {
             $container->get(ConcreteCycleA::class);
         } catch (CircularDependencyException) {
@@ -1130,7 +1284,7 @@ final class ContainerTest extends TestCase
         $shapes = array_unique(array_column($logger->records, 'message'));
 
         self::assertCount(
-            8,
+            9,
             $shapes,
             'The helper must exercise every log point; update it when adding one.',
         );
@@ -2682,6 +2836,78 @@ final class CtxCycleOne implements CtxCycleContract
 final class CtxCycleTwo implements CtxCycleContract
 {
     public function __construct(public readonly CtxCycleContract $dep)
+    {
+    }
+}
+
+// Fixtures for the tagged variadic collections: a handler hierarchy for the
+// happy paths, a broken member, a member that closes a cycle on its consumer
+// and a non-variadic parameter carrying a misplaced #[Tagged].
+
+interface TagHandler
+{
+}
+
+final class TagHandlerA implements TagHandler
+{
+}
+
+final class TagHandlerB implements TagHandler
+{
+}
+
+final class TagHandlerC implements TagHandler
+{
+}
+
+#[Singleton]
+final class TagSharedHandler implements TagHandler
+{
+}
+
+final class TagBrokenHandler implements TagHandler
+{
+    public function __construct(int $count)
+    {
+    }
+}
+
+final class NeedsTaggedVariadic
+{
+    /**
+     * @var list<TagHandler>
+     */
+    public array $handlers;
+
+    public function __construct(#[Tagged('handlers')] TagHandler ...$handlers)
+    {
+        $this->handlers = $handlers;
+    }
+}
+
+final class NeedsCycleTagged
+{
+    /**
+     * @var list<object>
+     */
+    public array $members;
+
+    public function __construct(#[Tagged('cycle.handlers')] object ...$members)
+    {
+        $this->members = $members;
+    }
+}
+
+final class TagCycleMember
+{
+    public function __construct(public readonly NeedsCycleTagged $parent)
+    {
+    }
+}
+
+final class TaggedOnNonVariadic
+{
+    public function __construct(#[Tagged('handlers')] public readonly Foo $foo)
     {
     }
 }

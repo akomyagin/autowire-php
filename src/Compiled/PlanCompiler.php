@@ -6,6 +6,7 @@ namespace AutowirePHP\Compiled;
 
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Attribute\Tagged;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
@@ -74,11 +75,13 @@ final class PlanCompiler
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
      * @param array<class-string, array<class-string, class-string>> $contextual
+     * @param array<string, list<class-string>> $tags
      */
     public function __construct(
         private readonly array $bindings,
         private readonly array $shared,
         private readonly array $contextual = [],
+        private readonly array $tags = [],
     ) {
     }
 
@@ -160,9 +163,18 @@ final class PlanCompiler
 
         if ($constructor !== null) {
             foreach ($constructor->getParameters() as $param) {
-                // A variadic parameter ends the argument list, encoded simply
-                // as the absence of specs after it.
+                // An untagged variadic parameter ends the argument list,
+                // encoded simply as the absence of specs after it; a #[Tagged]
+                // one bakes its member list into a single tagged spec — the
+                // set is known at compilation time because tag() flushes every
+                // loaded plan.
                 if ($param->isVariadic()) {
+                    $spec = $this->compileTaggedVariadic($param, $concrete);
+
+                    if ($spec !== null) {
+                        $args[] = $spec;
+                    }
+
                     break;
                 }
 
@@ -171,6 +183,41 @@ final class PlanCompiler
         }
 
         return CompiledPlan::buildNode($concrete, $sharedReason, $args);
+    }
+
+    /**
+     * A tagged spec for a #[Tagged] variadic parameter, or null when the
+     * parameter carries no attribute (the Stage 5 empty set stays encoded as
+     * the absence of a spec). Mirrors Container::resolveTaggedVariadic(): the
+     * member list — registration order, already deduplicated by tag() — is
+     * baked as ids, each member's own node is compiled so it lands in the
+     * plan and the manifest, and the spec carries the data the executor needs
+     * to replay the tagged-collection log record. An empty or unregistered
+     * tag still produces a spec with an empty id list, so the log record is
+     * replayed identically to the runtime path.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function compileTaggedVariadic(ReflectionParameter $param, string $declaringClass): ?array
+    {
+        $attributes = $param->getAttributes(Tagged::class);
+
+        if ($attributes === []) {
+            return null;
+        }
+
+        $tag = $attributes[0]->newInstance()->tag;
+        $ids = $this->tags[$tag] ?? [];
+
+        foreach ($ids as $memberId) {
+            $this->compileId($memberId);
+        }
+
+        return CompiledPlan::taggedSpec($ids, [
+            'parameter' => $param->getName(),
+            'class' => $declaringClass,
+            'tag' => $tag,
+        ]);
     }
 
     /**
