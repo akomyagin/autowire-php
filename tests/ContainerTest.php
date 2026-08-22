@@ -1106,12 +1106,14 @@ final class ContainerTest extends TestCase
         $container->singleton(SharedService::class);
 
         $container->factory(NoConstructor::class, static fn (Container $c): object => new NoConstructor());
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
 
         $container->get(FooInterface::class);
         $container->get(SharedService::class);
         $container->get(SharedService::class);
         $container->get(AttrSingleton::class);
         $container->get(NeedsInjectedImpl::class);
+        $container->get(CtxConsumerOne::class);
         $container->get(NoConstructor::class);
 
         try {
@@ -1128,7 +1130,7 @@ final class ContainerTest extends TestCase
         $shapes = array_unique(array_column($logger->records, 'message'));
 
         self::assertCount(
-            7,
+            8,
             $shapes,
             'The helper must exercise every log point; update it when adding one.',
         );
@@ -1779,6 +1781,253 @@ final class ContainerTest extends TestCase
         self::assertSame($first, $container->get(SharedService::class));
     }
 
+    public function testContextualBindingResolvesDifferentImplPerConsumer(): void
+    {
+        $container = new Container();
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxConsumerTwo::class, CtxStorage::class, CtxS3Storage::class);
+
+        self::assertInstanceOf(CtxLocalStorage::class, $container->get(CtxConsumerOne::class)->storage);
+        self::assertInstanceOf(CtxS3Storage::class, $container->get(CtxConsumerTwo::class)->storage);
+    }
+
+    public function testContextualBindingDoesNotAffectTopLevelGet(): void
+    {
+        $container = new Container();
+        $container->bind(CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxS3Storage::class);
+
+        // A direct get() has no consumer, so no context can apply: the global
+        // binding resolves the abstract exactly as before.
+        self::assertInstanceOf(CtxLocalStorage::class, $container->get(CtxStorage::class));
+    }
+
+    public function testContextualConsumerIsTheRequestedClassNotTheDeclaringParent(): void
+    {
+        $container = new Container();
+        $container->when(CtxChildConsumer::class, CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxParentConsumer::class, CtxStorage::class, CtxS3Storage::class);
+
+        // The consumer is the class being built (the child), not the parent
+        // that physically declares the constructor — the same value error
+        // messages and the #[Inject] log record already report.
+        self::assertInstanceOf(
+            CtxLocalStorage::class,
+            $container->get(CtxChildConsumer::class)->storage,
+        );
+    }
+
+    public function testContextualBeatsGlobalBindForConsumerParameter(): void
+    {
+        $container = new Container();
+        $container->bind(CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxS3Storage::class);
+
+        // Inside the consumer's constructor the context wins; the top-level
+        // get() of the abstract still follows the global binding.
+        self::assertInstanceOf(CtxS3Storage::class, $container->get(CtxConsumerOne::class)->storage);
+        self::assertInstanceOf(CtxLocalStorage::class, $container->get(CtxStorage::class));
+    }
+
+    public function testContextualBeatsInjectAttributeOnSameParameter(): void
+    {
+        $container = new Container();
+        $container->when(CtxInjectConsumer::class, CtxStorage::class, CtxS3Storage::class);
+
+        // External container configuration overrides the choice declared in
+        // the consumer's code — otherwise a class carrying #[Inject] could
+        // never be reconfigured without editing it.
+        self::assertInstanceOf(CtxS3Storage::class, $container->get(CtxInjectConsumer::class)->storage);
+    }
+
+    public function testInjectStillWinsWhenNoContextualForConsumer(): void
+    {
+        $container = new Container();
+        // Context registered for a different consumer must not leak.
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxS3Storage::class);
+
+        self::assertInstanceOf(CtxLocalStorage::class, $container->get(CtxInjectConsumer::class)->storage);
+    }
+
+    /**
+     * A union-typed parameter has no single target to redirect, so contextual
+     * binding is silently ignored for it — the same rule already applied to
+     * #[Inject] on a union parameter. Resolution falls through to the global
+     * bind() on the first union member instead.
+     */
+    public function testContextualBindingIsIgnoredForUnionTypedParameters(): void
+    {
+        $container = new Container();
+        $container->bind(CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxUnionConsumer::class, CtxStorage::class, CtxS3Storage::class);
+
+        self::assertInstanceOf(CtxLocalStorage::class, $container->get(CtxUnionConsumer::class)->storage);
+    }
+
+    public function testContextualConcreteMarkedSingletonIsCachedPerConcrete(): void
+    {
+        $container = new Container();
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxConsumerTwo::class, CtxStorage::class, CtxS3Storage::class);
+        $container->singleton(CtxLocalStorage::class);
+
+        $first = $container->get(CtxConsumerOne::class);
+        $second = $container->get(CtxConsumerOne::class);
+
+        // The redirect caches under the concrete id, so a shared contextual
+        // concrete is shared across builds of its consumer...
+        self::assertSame($first->storage, $second->storage);
+
+        // ...while another consumer's (unshared) concrete stays transient.
+        $other = $container->get(CtxConsumerTwo::class);
+
+        self::assertInstanceOf(CtxS3Storage::class, $other->storage);
+        self::assertNotSame($other->storage, $container->get(CtxConsumerTwo::class)->storage);
+    }
+
+    public function testSingletonOnInterfaceIsNotSharedAcrossContextualConsumers(): void
+    {
+        $container = new Container();
+        $container->singleton(CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxS3Storage::class);
+        $container->when(CtxConsumerTwo::class, CtxStorage::class, CtxS3Storage::class);
+
+        $one = $container->get(CtxConsumerOne::class);
+        $two = $container->get(CtxConsumerTwo::class);
+
+        // The contextual redirect bypasses the interface cache key entirely:
+        // each consumer builds its own concrete, nothing is shared through
+        // singleton(CtxStorage). Documented limitation, not an accident.
+        self::assertInstanceOf(CtxS3Storage::class, $one->storage);
+        self::assertInstanceOf(CtxS3Storage::class, $two->storage);
+        self::assertNotSame($one->storage, $two->storage);
+
+        // The interface singleton keeps working where no context applies —
+        // here, for the direct top-level get().
+        $direct = $container->get(CtxStorage::class);
+
+        self::assertInstanceOf(CtxLocalStorage::class, $direct);
+        self::assertSame($direct, $container->get(CtxStorage::class));
+    }
+
+    public function testContextualBindingCycleThroughTwoConsumersIsDetected(): void
+    {
+        $container = new Container();
+        $container->when(CtxCycleOne::class, CtxCycleContract::class, CtxCycleTwo::class);
+        $container->when(CtxCycleTwo::class, CtxCycleContract::class, CtxCycleOne::class);
+
+        try {
+            $container->get(CtxCycleOne::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            // The stack holds the chosen concrete ids — the abstract never
+            // enters it on a contextual redirect — so the chain closes on the
+            // repeated concrete and reads plainly.
+            self::assertSame(
+                [CtxCycleOne::class, CtxCycleTwo::class, CtxCycleOne::class],
+                $exception->getChain(),
+            );
+        }
+    }
+
+    public function testResolutionStackEmptyAfterContextualResolution(): void
+    {
+        $container = new Container();
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
+        $container->when(CtxCycleOne::class, CtxCycleContract::class, CtxCycleTwo::class);
+        $container->when(CtxCycleTwo::class, CtxCycleContract::class, CtxCycleOne::class);
+
+        $container->get(CtxConsumerOne::class);
+
+        try {
+            $container->get(CtxCycleOne::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException) {
+            // Expected: the state afterwards is what this test is about.
+        }
+
+        self::assertInstanceOf(CtxConsumerOne::class, $container->get(CtxConsumerOne::class));
+
+        $reflection = new ReflectionObject($container);
+
+        self::assertSame([], $reflection->getProperty('resolving')->getValue($container));
+        self::assertSame([], $reflection->getProperty('resolutionChain')->getValue($container));
+    }
+
+    public function testContextualBindingLogsDebugRecord(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
+
+        $container->get(CtxConsumerOne::class);
+
+        $record = self::singleRecordMatching($logger, 'Contextual binding applied');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame('storage', $record['context']['parameter']);
+        self::assertSame(CtxConsumerOne::class, $record['context']['consumer']);
+        self::assertSame(CtxLocalStorage::class, $record['context']['target']);
+        self::assertSame(1, $record['context']['depth']);
+    }
+
+    public function testContextualBindingDispatchesRequestedAndResolvedEvents(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
+
+        $container->get(CtxConsumerOne::class);
+
+        // The chosen concrete is requested as an ordinary child frame; the
+        // abstract id never appears because the redirect goes straight to the
+        // concrete, exactly like an #[Inject] target.
+        self::assertSame(
+            [[CtxConsumerOne::class, 0], [CtxLocalStorage::class, 1]],
+            array_map(
+                static fn (ResolutionRequested $event): array => [$event->id, $event->depth],
+                self::eventsOf($events, ResolutionRequested::class),
+            ),
+        );
+
+        self::assertSame(
+            [[CtxLocalStorage::class, 1], [CtxConsumerOne::class, 0]],
+            array_map(
+                static fn (ServiceResolved $event): array => [$event->id, $event->depth],
+                self::eventsOf($events, ServiceResolved::class),
+            ),
+        );
+        self::assertSame([], self::eventsOf($events, ResolutionFailed::class));
+    }
+
+    public function testWhenRegistrationIsBenignForResolvedInstances(): void
+    {
+        $container = new Container();
+        $container->singleton(SharedService::class);
+
+        $shared = $container->get(SharedService::class);
+
+        $container->when(CtxConsumerOne::class, CtxStorage::class, CtxLocalStorage::class);
+
+        // when() flushes loaded plans, but — like bind() — never drops
+        // instances that were already resolved.
+        self::assertSame($shared, $container->get(SharedService::class));
+    }
+
+    public function testContextualBindingToMissingClassThrowsNotFound(): void
+    {
+        $container = new Container();
+        $container->when(CtxConsumerOne::class, CtxStorage::class, 'AutowirePHP\\Tests\\CtxNoSuchImpl');
+
+        try {
+            $container->get(CtxConsumerOne::class);
+            self::fail('Expected NotFoundException was not thrown.');
+        } catch (NotFoundException $exception) {
+            // Diagnosable exactly like a bind() pointing at a missing class.
+            self::assertSame('AutowirePHP\\Tests\\CtxNoSuchImpl', $exception->getId());
+        }
+    }
+
     /**
      * @template TEvent of object
      * @param class-string<TEvent> $class
@@ -2348,6 +2597,92 @@ final class ThrowingDispatcher implements EventDispatcherInterface
         }
 
         return $event;
+    }
+}
+
+// Fixtures for the contextual binding scenarios: one interface, two
+// implementations, consumers of every flavour the priority rules distinguish.
+
+interface CtxStorage
+{
+}
+
+final class CtxLocalStorage implements CtxStorage
+{
+}
+
+final class CtxS3Storage implements CtxStorage
+{
+}
+
+final class CtxConsumerOne
+{
+    public function __construct(public readonly CtxStorage $storage)
+    {
+    }
+}
+
+final class CtxConsumerTwo
+{
+    public function __construct(public readonly CtxStorage $storage)
+    {
+    }
+}
+
+/**
+ * Deliberately not final and carrying the constructor: CtxChildConsumer
+ * inherits it, so a test can prove the contextual consumer is the class being
+ * built, not the parent that declared the constructor.
+ */
+class CtxParentConsumer
+{
+    public function __construct(public readonly CtxStorage $storage)
+    {
+    }
+}
+
+final class CtxChildConsumer extends CtxParentConsumer
+{
+}
+
+final class CtxInjectConsumer
+{
+    public function __construct(
+        #[Inject(CtxLocalStorage::class)] public readonly CtxStorage $storage,
+    ) {
+    }
+}
+
+interface CtxAlt
+{
+}
+
+final class CtxAltImpl implements CtxAlt
+{
+}
+
+final class CtxUnionConsumer
+{
+    public function __construct(public readonly CtxStorage|CtxAlt $storage)
+    {
+    }
+}
+
+interface CtxCycleContract
+{
+}
+
+final class CtxCycleOne implements CtxCycleContract
+{
+    public function __construct(public readonly CtxCycleContract $dep)
+    {
+    }
+}
+
+final class CtxCycleTwo implements CtxCycleContract
+{
+    public function __construct(public readonly CtxCycleContract $dep)
+    {
     }
 }
 

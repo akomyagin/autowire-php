@@ -46,8 +46,11 @@ final class CompiledPlan
     /**
      * Bumped whenever the payload structure changes; a payload with any other
      * stamp is silently discarded and recompiled.
+     *
+     * 2 -> 3: service specs gained the `context` log descriptor and the
+     * configHash formula started covering the contextual binding map.
      */
-    public const FORMAT_VERSION = 2;
+    public const FORMAT_VERSION = 3;
 
     public const NODE_BUILD = 'build';
     public const NODE_FAIL = 'fail';
@@ -273,12 +276,20 @@ final class CompiledPlan
     }
 
     /**
+     * The `inject` and `context` blocks are log descriptors, not behaviour:
+     * the executor resolves the id either way and only replays the matching
+     * debug record. They are mutually exclusive by construction — the
+     * compiler's contextual branch returns before the #[Inject] branch runs —
+     * but each keeps its own key because the two mechanisms log different
+     * messages and must never be conflated.
+     *
      * @param array{parameter: string, class: string, target: string}|null $inject
+     * @param array{parameter: string, consumer: string, target: string}|null $context
      * @return array<string, mixed>
      */
-    public static function serviceSpec(string $id, ?array $inject): array
+    public static function serviceSpec(string $id, ?array $inject, ?array $context = null): array
     {
-        return ['kind' => self::SPEC_SERVICE, 'id' => $id, 'inject' => $inject];
+        return ['kind' => self::SPEC_SERVICE, 'id' => $id, 'inject' => $inject, 'context' => $context];
     }
 
     /**
@@ -374,7 +385,9 @@ final class CompiledPlan
             self::SPEC_FAIL => self::isValidException($spec['exception'] ?? null),
             self::SPEC_SERVICE => is_string($spec['id'] ?? null)
                 && array_key_exists('inject', $spec)
-                && self::isValidInject($spec['inject']),
+                && self::isValidInject($spec['inject'])
+                && array_key_exists('context', $spec)
+                && self::isValidContext($spec['context']),
             self::SPEC_PROBE => is_string($spec['id'] ?? null)
                 && is_array($spec['fallback'] ?? null)
                 && self::isValidSpec($spec['fallback'])
@@ -398,6 +411,18 @@ final class CompiledPlan
             && is_string($inject['parameter'] ?? null)
             && is_string($inject['class'] ?? null)
             && is_string($inject['target'] ?? null);
+    }
+
+    private static function isValidContext(mixed $context): bool
+    {
+        if ($context === null) {
+            return true;
+        }
+
+        return is_array($context)
+            && is_string($context['parameter'] ?? null)
+            && is_string($context['consumer'] ?? null)
+            && is_string($context['target'] ?? null);
     }
 
     private static function isValidException(mixed $exception): bool

@@ -125,6 +125,14 @@ final class Container implements ContainerInterface
     private array $shared = [];
 
     /**
+     * Contextual bindings registered via when(): consumer class -> abstract
+     * id -> concrete class to use for that consumer's constructor parameter.
+     *
+     * @var array<class-string, array<class-string, class-string>>
+     */
+    private array $contextual = [];
+
+    /**
      * User factories, keyed by the id they resolve. A registered factory is
      * the most specific way to build an id: get() checks this map before the
      * compiled plan, the bindings and autowiring, so none of them apply to a
@@ -159,7 +167,7 @@ final class Container implements ContainerInterface
     /**
      * In-memory merge of the node maps of every plan loaded or compiled so
      * far, keyed by id. A get() for an id already present here never goes back
-     * to the cache. Flushed by bind()/singleton() — see flushPlans().
+     * to the cache. Flushed by bind()/singleton()/when() — see flushPlans().
      *
      * @var array<string, array<string, mixed>>
      */
@@ -266,6 +274,50 @@ final class Container implements ContainerInterface
         if ($concrete === null) {
             $this->flushPlans();
         }
+    }
+
+    /**
+     * Register a contextual binding: when $consumer is being built and its
+     * constructor declares a parameter of type $abstract, resolve that
+     * parameter as $concrete instead of whatever the global configuration
+     * would produce.
+     *
+     * The consumer is the class being built — the same value error messages
+     * and the #[Inject] log record report — NOT the class that declared the
+     * constructor in an inheritance hierarchy. With `B extends A` and the
+     * constructor declared in A, resolving B applies the context registered
+     * for B, never the one registered for A. (The compilation manifest
+     * deliberately looks at the declaring class instead — that is about which
+     * files invalidate a cached plan, not about who the consumer is.)
+     *
+     * Parameter resolution priority: explicit bind() > contextual binding >
+     * #[Inject] attribute > autowiring by type. The context wins over a
+     * global bind() of the same abstract only inside the consumer's
+     * constructor; a direct top-level get($abstract) has no consumer and goes
+     * through bind()/autowiring unaffected.
+     *
+     * The redirect targets the chosen concrete class directly, so shared
+     * semantics apply to that concrete id (singleton(Concrete) / #[Singleton]
+     * on it). A singleton($abstract) on the interface is never shared across
+     * contextual consumers: their resolutions bypass the $abstract cache key
+     * entirely, each consumer builds its own concrete. This follows from the
+     * instance cache being keyed by the requested id and is deliberate — the
+     * redirect already segregates instances per concrete class correctly.
+     *
+     * Only single named-type parameters are checked: a union-typed parameter
+     * ($abstract being one of its members) never consults this map, matching
+     * how #[Inject] is already silently ignored on union parameters. This is
+     * the same rule applied consistently, not an oversight — see
+     * resolveUnionParameter()/compileUnionParameter().
+     *
+     * @param class-string $consumer
+     * @param class-string $abstract
+     * @param class-string $concrete
+     */
+    public function when(string $consumer, string $abstract, string $concrete): void
+    {
+        $this->contextual[$consumer][$abstract] = $concrete;
+        $this->flushPlans();
     }
 
     /**
@@ -653,7 +705,8 @@ final class Container implements ContainerInterface
                 }
             }
 
-            $plan = (new PlanCompiler($this->bindings, $this->shared))->compile($id, $hash);
+            $plan = (new PlanCompiler($this->bindings, $this->shared, $this->contextual))
+                ->compile($id, $hash);
 
             // See the array_merge() note above — same reasoning for a
             // freshly compiled plan's nodes.
@@ -678,18 +731,19 @@ final class Container implements ContainerInterface
     }
 
     /**
-     * Hash of the current bindings/shared/factories configuration, memoised
-     * until the next registration. Participates in every cache key, so
-     * changing a binding, registering a singleton or registering a factory
-     * can never reuse a plan compiled without it. Of the factories only the
-     * keys are hashed: which ids bypass the plan is configuration, the
-     * closure bodies are not.
+     * Hash of the current bindings/shared/contextual/factories configuration,
+     * memoised until the next registration. Participates in every cache key,
+     * so changing a binding, registering a singleton, registering a
+     * contextual binding or registering a factory can never reuse a plan
+     * compiled without it. Of the factories only the keys are hashed: which
+     * ids bypass the plan is configuration, the closure bodies are not.
      */
     private function configHash(): string
     {
         return $this->configHash ??= PlanCache::configHash(
             $this->bindings,
             $this->shared,
+            $this->contextual,
             array_keys($this->factories),
         );
     }
@@ -778,8 +832,9 @@ final class Container implements ContainerInterface
 
     /**
      * Resolve a single constructor parameter. Resolution priority: class type
-     * through the container -> union members in order -> default value -> null
-     * (if nullable) -> UnresolvableParameterException.
+     * through the container (contextual binding -> #[Inject] -> plain get) ->
+     * union members in order -> default value -> null (if nullable) ->
+     * UnresolvableParameterException.
      *
      * A CircularDependencyException is never swallowed while probing nullable
      * or union members: it always propagates to the caller.
@@ -799,6 +854,24 @@ final class Container implements ContainerInterface
         }
 
         if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
+            $contextual = $this->contextual[$declaringClass][$type->getName()] ?? null;
+            if ($contextual !== null) {
+                $this->logger->debug(
+                    // Like the #[Inject] target below, the chosen class may
+                    // itself be an abstraction that the following get()
+                    // re-resolves through bindings.
+                    'Contextual binding applied to parameter ${parameter} of {consumer}: resolving as {target}',
+                    [
+                        'parameter' => $param->getName(),
+                        'consumer' => $declaringClass,
+                        'target' => $contextual,
+                        'depth' => $this->depth(),
+                    ],
+                );
+
+                return $this->get($contextual);
+            }
+
             $injected = $this->resolveInjectTarget($param, $type->getName());
             if ($injected !== null) {
                 $this->logger->debug(
@@ -888,6 +961,11 @@ final class Container implements ContainerInterface
     /**
      * Resolve a union-typed constructor parameter by trying each class member
      * in declaration order, then falling back to the default value or null.
+     *
+     * Neither contextual bindings nor #[Inject] are consulted here — both are
+     * single-target mechanisms and a union parameter has no single target to
+     * redirect. This mirrors the existing #[Inject]-on-union behaviour; see
+     * Container::when().
      *
      * @throws UnresolvableParameterException when no union member can be
      *         resolved and there is no default value or null fallback.
