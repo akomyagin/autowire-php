@@ -6,6 +6,7 @@ namespace AutowirePHP;
 
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Attribute\Tagged;
 use AutowirePHP\Cache\PlanCache;
 use AutowirePHP\Compiled\CompiledPlan;
 use AutowirePHP\Compiled\PlanCompiler;
@@ -122,6 +123,16 @@ final class Container implements ContainerInterface
      * @var array<string, object>
      */
     private array $instances = [];
+
+    /**
+     * Tag name -> ordered, deduplicated list of concrete classes registered
+     * under it via tag(). Keyed by the tag, not by the class: the consuming
+     * scenario is always "give me every member of tag T", so the map is read
+     * in exactly this direction and never has to be inverted.
+     *
+     * @var array<string, list<class-string>>
+     */
+    private array $tags = [];
 
     private readonly LoggerInterface $logger;
 
@@ -246,6 +257,44 @@ final class Container implements ContainerInterface
         if ($concrete === null) {
             $this->flushPlans();
         }
+    }
+
+    /**
+     * Register concrete classes under a named tag. A variadic constructor
+     * parameter marked #[Tagged] with the same tag name receives one resolved
+     * instance per member instead of the default empty set.
+     *
+     * Repeated calls for one tag accumulate, never replace, so independent
+     * modules can append their handlers to a common tag. The collection order
+     * is the registration order; a class registered twice enters the tag once,
+     * at the position of its first occurrence.
+     *
+     * Every member resolves through an ordinary get(), so cycle detection,
+     * shared semantics, events and log records apply per member — and a member
+     * that cannot be built fails the whole resolution of the consumer instead
+     * of being silently dropped: a registered member is a deliberate part of
+     * the configuration, and its failure must surface, not shorten the
+     * collection by one. A tag nobody registered yields an empty collection —
+     * zero members is a legal state, not an error.
+     *
+     * This imperative call is deliberately the only registration path. A
+     * declarative #[Tag] class attribute was considered and rejected (user
+     * decision recorded in docs/POST_MVP_PLAN.md): PHP has no registry of all
+     * application classes, so the attribute could only be discovered on
+     * classes the container happens to reflect — membership would then depend
+     * on resolution order and diverge between the runtime and compiled paths.
+     *
+     * @param list<class-string> $concretes
+     */
+    public function tag(string $tag, array $concretes): void
+    {
+        foreach ($concretes as $concrete) {
+            if (!in_array($concrete, $this->tags[$tag] ?? [], true)) {
+                $this->tags[$tag][] = $concrete;
+            }
+        }
+
+        $this->flushPlans();
     }
 
     /**
@@ -561,7 +610,7 @@ final class Container implements ContainerInterface
                 }
             }
 
-            $plan = (new PlanCompiler($this->bindings, $this->shared))->compile($id, $hash);
+            $plan = (new PlanCompiler($this->bindings, $this->shared, $this->tags))->compile($id, $hash);
 
             // See the array_merge() note above — same reasoning for a
             // freshly compiled plan's nodes.
@@ -586,13 +635,14 @@ final class Container implements ContainerInterface
     }
 
     /**
-     * Hash of the current bindings/shared maps, memoised until the next
-     * registration. Participates in every cache key, so changing a binding or
-     * registering a singleton can never reuse a plan compiled without it.
+     * Hash of the current bindings/shared/tags maps, memoised until the next
+     * registration. Participates in every cache key, so changing a binding,
+     * registering a singleton or extending a tag can never reuse a plan
+     * compiled without it.
      */
     private function configHash(): string
     {
-        return $this->configHash ??= PlanCache::configHash($this->bindings, $this->shared);
+        return $this->configHash ??= PlanCache::configHash($this->bindings, $this->shared, $this->tags);
     }
 
     /**
@@ -667,7 +717,16 @@ final class Container implements ContainerInterface
         $args = [];
 
         foreach ($constructor->getParameters() as $param) {
+            // A variadic parameter is always the last one. Untagged it ends
+            // the argument list and PHP fills it with an empty set; marked
+            // #[Tagged] it appends the resolved tag members as trailing
+            // positional arguments, which newInstanceArgs() spreads into the
+            // variadic tail.
             if ($param->isVariadic()) {
+                foreach ($this->resolveTaggedVariadic($param, $reflection->getName()) as $member) {
+                    $args[] = $member;
+                }
+
                 break;
             }
 
@@ -675,6 +734,54 @@ final class Container implements ContainerInterface
         }
 
         return $reflection->newInstanceArgs($args);
+    }
+
+    /**
+     * Resolve the members for a #[Tagged] variadic parameter, or an empty
+     * list when the parameter carries no attribute or the tag has no members.
+     *
+     * Each member goes through an ordinary get(), so a member that cannot be
+     * built propagates its exception and fails the consumer — deliberately
+     * unlike the nullable/union probes, whose catch is part of the parameter
+     * contract; a tag member has no such contract, every member is mandatory.
+     * A cycle closing through a member is caught by the untouched
+     * enter()/leave() of the child frame.
+     *
+     * This branch has a second implementor: PlanCompiler bakes the same
+     * member list into a tagged spec, and PlanExecutor replays this very log
+     * record. Any change here must be mirrored there.
+     *
+     * @return list<object>
+     */
+    private function resolveTaggedVariadic(ReflectionParameter $param, string $declaringClass): array
+    {
+        $attributes = $param->getAttributes(Tagged::class);
+
+        if ($attributes === []) {
+            return [];
+        }
+
+        $tag = $attributes[0]->newInstance()->tag;
+        $ids = $this->tags[$tag] ?? [];
+
+        $this->logger->debug(
+            'Tagged collection for parameter ${parameter} of {class}: resolving {count} members of tag {tag}',
+            [
+                'parameter' => $param->getName(),
+                'class' => $declaringClass,
+                'tag' => $tag,
+                'count' => count($ids),
+                'depth' => $this->depth(),
+            ],
+        );
+
+        $members = [];
+
+        foreach ($ids as $id) {
+            $members[] = $this->get($id);
+        }
+
+        return $members;
     }
 
     /**

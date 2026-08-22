@@ -68,6 +68,21 @@ final class PlanExecutor
         $args = [];
 
         foreach ($node['args'] as $spec) {
+            // The tagged spec is the one kind that yields several positional
+            // arguments — the members of a #[Tagged] variadic tail — so it is
+            // spliced here instead of going through the one-value argument().
+            // Validation confines it to a build node's argument list, and it
+            // is always the last spec there (a variadic parameter is always
+            // the last parameter), so the members land as trailing positional
+            // arguments that the spread below folds into the variadic.
+            if ($spec['kind'] === CompiledPlan::SPEC_TAGGED) {
+                foreach ($this->taggedArguments($spec) as $member) {
+                    $args[] = $member;
+                }
+
+                continue;
+            }
+
             $args[] = $this->argument($spec);
         }
 
@@ -142,6 +157,45 @@ final class PlanExecutor
             default:
                 throw new LogicException(sprintf('Unknown compiled argument spec kind "%s".', $spec['kind']));
         }
+    }
+
+    /**
+     * Resolve the members of a tagged variadic tail, replaying the
+     * tagged-collection log record first: on the runtime path it lives inside
+     * resolveTaggedVariadic(), so like the #[Inject] record it must be
+     * replayed by hand — message, context keys and their order match exactly.
+     *
+     * Each member goes through the container's public get(), so a member that
+     * cannot be built propagates its exception and fails the consumer, and a
+     * cycle through a member is caught by the untouched enter()/leave() —
+     * exactly as on the runtime path. No catch here: unlike a probe, a tag
+     * member has no fallback contract.
+     *
+     * @param array<string, mixed> $spec
+     * @return list<object>
+     */
+    private function taggedArguments(array $spec): array
+    {
+        $tagged = $spec['tagged'];
+
+        $this->logger->debug(
+            'Tagged collection for parameter ${parameter} of {class}: resolving {count} members of tag {tag}',
+            [
+                'parameter' => $tagged['parameter'],
+                'class' => $tagged['class'],
+                'tag' => $tagged['tag'],
+                'count' => count($spec['ids']),
+                'depth' => ($this->depth)(),
+            ],
+        );
+
+        $members = [];
+
+        foreach ($spec['ids'] as $id) {
+            $members[] = $this->container->get($id);
+        }
+
+        return $members;
     }
 
     /**

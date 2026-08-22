@@ -7,6 +7,7 @@ namespace AutowirePHP\Tests;
 use ArrayObject;
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Attribute\Tagged;
 use AutowirePHP\Cache\PlanCache;
 use AutowirePHP\Container;
 use AutowirePHP\Event\ResolutionFailed;
@@ -48,7 +49,7 @@ use UnitEnum;
 final class CompiledContainerTest extends TestCase
 {
     /**
-     * The six resolution log records plus the listener-suppression record.
+     * The seven resolution log records plus the listener-suppression record.
      * Everything outside this list is about the plan cache itself — the only
      * observability difference the compiled mode is allowed to introduce.
      */
@@ -57,6 +58,7 @@ final class CompiledContainerTest extends TestCase
         'Returning shared instance for {id} from cache',
         'Binding applied: {id} -> {concrete}',
         'Inject attribute applied to parameter ${parameter} of {class}: resolving as {target}',
+        'Tagged collection for parameter ${parameter} of {class}: resolving {count} members of tag {tag}',
         'Caching shared instance for {id} (reason: {reason})',
         'Circular dependency detected: {chain}',
         'Listener of {event} threw {class} and was suppressed in favour of {failure}',
@@ -76,6 +78,7 @@ final class CompiledContainerTest extends TestCase
             static function (Container $container): void {
                 $container->bind(CpBoundInterface::class, CpBoundImpl::class);
                 $container->singleton(CpSharedByMethod::class);
+                $container->tag('cp.parity', [CpLeaf::class]);
             },
             static function (Container $container): object {
                 $container->get(CpParityRoot::class);
@@ -187,6 +190,40 @@ final class CompiledContainerTest extends TestCase
             $noConfig,
             static fn (Container $c): object => $c->get(ArrayObject::class),
         ];
+
+        yield 'tagged variadic collection' => [
+            static function (Container $container): void {
+                $container->tag('cp.handlers', [CpTagA::class, CpTagB::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'tagged variadic with duplicate and accumulated registration' => [
+            static function (Container $container): void {
+                $container->tag('cp.handlers', [CpTagB::class]);
+                $container->tag('cp.handlers', [CpTagA::class, CpTagB::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'tagged variadic with an unregistered tag' => [
+            $noConfig,
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'tagged variadic with a member that cannot be built' => [
+            static function (Container $container): void {
+                $container->tag('cp.handlers', [CpTagA::class, CpTagBroken::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'cycle through a tagged member' => [
+            static function (Container $container): void {
+                $container->tag('cp.cycle', [CpTagCycleMember::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedCycleConsumer::class),
+        ];
     }
 
     /**
@@ -233,6 +270,9 @@ final class CompiledContainerTest extends TestCase
             self::assertSame($container->get(CpSharedByAttr::class), $root->sharedByAttr, $label);
             self::assertNull($root->note, $label);
             self::assertSame(42, $root->answer, $label);
+            // The 'cp.parity' tag is deliberately not registered here: a
+            // #[Tagged] variadic on an unregistered tag must keep receiving
+            // the empty set, in compiled mode too.
             self::assertSame([], $root->variadic, $label);
         }
     }
@@ -390,6 +430,46 @@ final class CompiledContainerTest extends TestCase
         $container->singleton(CpLeaf::class);
 
         self::assertSame($container->get(CpLeaf::class), $container->get(CpLeaf::class));
+    }
+
+    public function testTaggedCollectionSurvivesTheCacheRoundTrip(): void
+    {
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold', 'warm'] as $label) {
+            $container = new Container(null, null, $cache);
+            $container->tag('cp.handlers', [CpTagA::class, CpTagB::class]);
+
+            $consumer = $container->get(CpTaggedConsumer::class);
+
+            self::assertSame(
+                [CpTagA::class, CpTagB::class],
+                array_map(static fn (CpTagMember $m): string => $m::class, $consumer->members),
+                $label . ': member set or order diverged',
+            );
+        }
+
+        self::assertCount(1, $cache->writes, 'The warm run must load the baked tag, not recompile.');
+    }
+
+    public function testTaggedCollectionInvalidatesPlanOnTagRegistration(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+
+        self::assertSame([], $container->get(CpTaggedConsumer::class)->members);
+
+        // tag() must flush the loaded plans and land on a different cache key:
+        // the tag map participates in configHash, so the plan compiled for the
+        // empty tag can never be reused for the extended one.
+        $container->tag('cp.handlers', [CpTagA::class]);
+
+        $members = $container->get(CpTaggedConsumer::class)->members;
+
+        self::assertCount(1, $members);
+        self::assertInstanceOf(CpTagA::class, $members[0]);
+        self::assertCount(2, $cache->writes);
+        self::assertNotSame($cache->writes[0], $cache->writes[1]);
     }
 
     // ------------------------------------------------- the cache as storage
@@ -1401,7 +1481,9 @@ final class CpSharedByAttr implements CpAttrIface
  * plain service, service through a binding, #[Inject] service, resolving and
  * failing nullable probes, a union probe, shared instances of both flavours,
  * a nullable builtin (null spec), a defaulted builtin (deferred default spec)
- * and a variadic tail that cuts the argument list.
+ * and a #[Tagged] variadic tail (tagged spec). With the 'cp.parity' tag
+ * unregistered the tail still receives the empty set, so scenarios that do
+ * not call tag() keep the pre-tagging behaviour.
  */
 final class CpParityRoot
 {
@@ -1421,7 +1503,7 @@ final class CpParityRoot
         public readonly CpSharedByAttr $sharedByAttr,
         public readonly ?string $note,
         public readonly int $answer = 42,
-        CpLeaf ...$variadic,
+        #[Tagged('cp.parity')] CpLeaf ...$variadic,
     ) {
         $this->variadic = $variadic;
     }
@@ -1672,6 +1754,60 @@ final class CpServiceOrCompileGhost
 final class CpServiceOrLateGhost
 {
     public function __construct(public readonly CpService|CpLateGhost $v)
+    {
+    }
+}
+
+// Fixtures for the tagged variadic collections in compiled mode.
+
+interface CpTagMember
+{
+}
+
+final class CpTagA implements CpTagMember
+{
+}
+
+final class CpTagB implements CpTagMember
+{
+}
+
+final class CpTagBroken implements CpTagMember
+{
+    public function __construct(int $count)
+    {
+    }
+}
+
+final class CpTaggedConsumer
+{
+    /**
+     * @var list<CpTagMember>
+     */
+    public array $members;
+
+    public function __construct(#[Tagged('cp.handlers')] CpTagMember ...$members)
+    {
+        $this->members = $members;
+    }
+}
+
+final class CpTaggedCycleConsumer
+{
+    /**
+     * @var list<object>
+     */
+    public array $members;
+
+    public function __construct(#[Tagged('cp.cycle')] object ...$members)
+    {
+        $this->members = $members;
+    }
+}
+
+final class CpTagCycleMember
+{
+    public function __construct(public readonly CpTaggedCycleConsumer $parent)
     {
     }
 }

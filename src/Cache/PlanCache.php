@@ -43,15 +43,22 @@ final class PlanCache
      * the same cache entry, hence the sort before hashing. The format version
      * participates so that a library upgrade never resurrects an old payload.
      *
+     * The tag map is sorted by tag name only: the member lists inside keep
+     * their order, because member order is semantic (it is the order of the
+     * injected collection), so two registrations differing only in member
+     * order genuinely are different configurations.
+     *
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
+     * @param array<string, list<class-string>> $tags
      */
-    public static function configHash(array $bindings, array $shared): string
+    public static function configHash(array $bindings, array $shared, array $tags = []): string
     {
         ksort($bindings);
         ksort($shared);
+        ksort($tags);
 
-        return hash('sha256', serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared]));
+        return hash('sha256', serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $tags]));
     }
 
     /**

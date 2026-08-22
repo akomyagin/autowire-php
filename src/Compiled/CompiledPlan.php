@@ -46,8 +46,9 @@ final class CompiledPlan
     /**
      * Bumped whenever the payload structure changes; a payload with any other
      * stamp is silently discarded and recompiled.
+     * 3: tagged variadic collections (the tagged spec kind).
      */
-    public const FORMAT_VERSION = 2;
+    public const FORMAT_VERSION = 3;
 
     public const NODE_BUILD = 'build';
     public const NODE_FAIL = 'fail';
@@ -58,6 +59,7 @@ final class CompiledPlan
     public const SPEC_DEFAULT = 'default';
     public const SPEC_NULL = 'null';
     public const SPEC_FAIL = 'fail';
+    public const SPEC_TAGGED = 'tagged';
 
     /**
      * The only spec kinds a probe may fall back to after a failed child
@@ -321,6 +323,24 @@ final class CompiledPlan
     }
 
     /**
+     * A #[Tagged] variadic tail: the one spec kind that contributes several
+     * positional arguments — one resolved instance per member id, spliced
+     * into the end of the argument list by the executor. It is neither a
+     * probe fallback nor a probeAny terminal (see the whitelists above): it
+     * only ever appears as the last entry of a build node's argument list.
+     *
+     * @param list<string> $ids tag members, in registration order, deduplicated
+     * @param array{parameter: string, class: string, tag: string} $tagged
+     *        data for replaying the tagged-collection log record, which on the
+     *        runtime path lives inside resolveTaggedVariadic()
+     * @return array<string, mixed>
+     */
+    public static function taggedSpec(array $ids, array $tagged): array
+    {
+        return ['kind' => self::SPEC_TAGGED, 'ids' => $ids, 'tagged' => $tagged];
+    }
+
+    /**
      * @param list<string> $args
      * @return array<string, mixed>
      */
@@ -384,6 +404,12 @@ final class CompiledPlan
                 && is_array($spec['terminal'] ?? null)
                 && self::isValidSpec($spec['terminal'])
                 && in_array($spec['terminal']['kind'], self::PROBE_ANY_TERMINAL_KINDS, true),
+            self::SPEC_TAGGED => is_array($spec['ids'] ?? null)
+                && $spec['ids'] === array_filter($spec['ids'], 'is_string')
+                && is_array($spec['tagged'] ?? null)
+                && is_string($spec['tagged']['parameter'] ?? null)
+                && is_string($spec['tagged']['class'] ?? null)
+                && is_string($spec['tagged']['tag'] ?? null),
             default => false,
         };
     }
