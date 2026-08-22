@@ -30,6 +30,7 @@ use RuntimeException;
 use stdClass;
 use Stringable;
 use Throwable;
+use TypeError;
 
 final class ContainerTest extends TestCase
 {
@@ -1104,11 +1105,14 @@ final class ContainerTest extends TestCase
         $container->bind(FooInterface::class, Foo::class);
         $container->singleton(SharedService::class);
 
+        $container->factory(NoConstructor::class, static fn (Container $c): object => new NoConstructor());
+
         $container->get(FooInterface::class);
         $container->get(SharedService::class);
         $container->get(SharedService::class);
         $container->get(AttrSingleton::class);
         $container->get(NeedsInjectedImpl::class);
+        $container->get(NoConstructor::class);
 
         try {
             $container->get(ConcreteCycleA::class);
@@ -1124,7 +1128,7 @@ final class ContainerTest extends TestCase
         $shapes = array_unique(array_column($logger->records, 'message'));
 
         self::assertCount(
-            6,
+            7,
             $shapes,
             'The helper must exercise every log point; update it when adding one.',
         );
@@ -1509,6 +1513,270 @@ final class ContainerTest extends TestCase
         self::assertCount(2, self::recordsMatching($logger, 'Resolving {id}'));
         self::assertCount(2, self::eventsOf($events, ResolutionRequested::class));
         self::assertCount(2, self::eventsOf($events, ServiceResolved::class));
+    }
+
+    public function testResolvesThroughFactoryClosure(): void
+    {
+        $container = new Container();
+        $foo = new Foo();
+        $container->factory(FooInterface::class, static fn (Container $c): object => $foo);
+
+        self::assertSame($foo, $container->get(FooInterface::class));
+    }
+
+    public function testFactoryReceivesContainerAndCanResolveDependencies(): void
+    {
+        $container = new Container();
+        $container->factory(
+            FactoryBuilt::class,
+            static fn (Container $c): object => new FactoryBuilt($c->get(GraphD::class), 'db://prod'),
+        );
+
+        $built = $container->get(FactoryBuilt::class);
+
+        self::assertInstanceOf(FactoryBuilt::class, $built);
+        self::assertInstanceOf(GraphD::class, $built->dep);
+        self::assertSame('db://prod', $built->dsn);
+    }
+
+    public function testTransientFactoryIsInvokedOnEachGet(): void
+    {
+        $calls = 0;
+        $container = new Container();
+        $container->factory(NoConstructor::class, static function (Container $c) use (&$calls): object {
+            ++$calls;
+
+            return new NoConstructor();
+        });
+
+        $first = $container->get(NoConstructor::class);
+        $second = $container->get(NoConstructor::class);
+
+        self::assertNotSame($first, $second);
+        self::assertSame(2, $calls);
+    }
+
+    public function testSingletonFactoryIsInvokedOnceAndCached(): void
+    {
+        // Both registration orders: the maps are independent, so which call
+        // comes first must not matter.
+        foreach (['factory first', 'singleton first'] as $order) {
+            $calls = 0;
+            $container = new Container();
+
+            $register = static function (Container $c) use (&$calls): void {
+                $c->factory(NoConstructor::class, static function (Container $c) use (&$calls): object {
+                    ++$calls;
+
+                    return new NoConstructor();
+                });
+            };
+
+            if ($order === 'factory first') {
+                $register($container);
+                $container->singleton(NoConstructor::class);
+            } else {
+                $container->singleton(NoConstructor::class);
+                $register($container);
+            }
+
+            $first = $container->get(NoConstructor::class);
+            $second = $container->get(NoConstructor::class);
+
+            self::assertSame($first, $second, $order);
+            self::assertSame(1, $calls, $order);
+        }
+    }
+
+    public function testFactoryExceptionPropagatesUnwrapped(): void
+    {
+        $failure = new RuntimeException('factory is broken');
+        $container = new Container();
+        $container->factory(FooInterface::class, static fn (Container $c): object => throw $failure);
+
+        try {
+            $container->get(FooInterface::class);
+            self::fail('Expected the factory exception to reach the caller.');
+        } catch (RuntimeException $exception) {
+            // The very same instance, not a wrapper: a factory failure is a
+            // user-code failure, like a throwing constructor.
+            self::assertSame($failure, $exception);
+            self::assertNotInstanceOf(ContainerException::class, $exception);
+        }
+    }
+
+    /**
+     * A factory violating its Closure(Container): object contract fails with
+     * a message naming the offending id and the wrong type, instead of
+     * surfacing incidentally inside the ServiceResolved event constructor.
+     */
+    public function testFactoryReturningNonObjectThrowsDiagnosableTypeError(): void
+    {
+        $container = new Container();
+        $container->factory(FooInterface::class, static fn (Container $c) => 'not an object');
+
+        $this->expectException(TypeError::class);
+        $this->expectExceptionMessage(sprintf(
+            'Factory registered for "%s" must return an object, got string.',
+            FooInterface::class,
+        ));
+
+        $container->get(FooInterface::class);
+    }
+
+    /**
+     * Symmetry guard with the constructor behaviour: a factory failure carries
+     * no ContainerException marker, so the enclosing nullable probe must let
+     * it through instead of substituting null.
+     */
+    public function testFactoryExceptionAsDependencyIsNotSwallowedByNullableProbe(): void
+    {
+        $container = new Container();
+        $container->factory(
+            BarInterface::class,
+            static fn (Container $c): object => throw new RuntimeException('factory is broken'),
+        );
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('factory is broken');
+
+        $container->get(NeedsNullableBar::class);
+    }
+
+    public function testFactoryCallingSameIdDetectsCycle(): void
+    {
+        $container = new Container();
+        $container->factory(
+            FooInterface::class,
+            static fn (Container $c): object => $c->get(FooInterface::class),
+        );
+
+        try {
+            $container->get(FooInterface::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            self::assertSame([FooInterface::class, FooInterface::class], $exception->getChain());
+            self::assertStringContainsString(FooInterface::class, $exception->getMessage());
+        }
+    }
+
+    public function testResolutionStackIsEmptyAfterFactoryGet(): void
+    {
+        $container = new Container();
+        $container->factory(FooInterface::class, static fn (Container $c): object => new Foo());
+
+        $container->get(FooInterface::class);
+
+        $reflection = new ReflectionObject($container);
+
+        self::assertSame([], $reflection->getProperty('resolving')->getValue($container));
+        self::assertSame([], $reflection->getProperty('resolutionChain')->getValue($container));
+
+        // And after a caught factory cycle a valid graph must still resolve.
+        $container->factory(
+            BarInterface::class,
+            static fn (Container $c): object => $c->get(BarInterface::class),
+        );
+
+        try {
+            $container->get(BarInterface::class);
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException) {
+            // Expected: what matters is the state afterwards.
+        }
+
+        self::assertInstanceOf(GraphA::class, $container->get(GraphA::class));
+        self::assertSame([], $reflection->getProperty('resolving')->getValue($container));
+        self::assertSame([], $reflection->getProperty('resolutionChain')->getValue($container));
+    }
+
+    public function testFactoryDispatchesRequestedAndResolvedEvents(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+        $container->factory(FooInterface::class, static fn (Container $c): object => new Foo());
+
+        $instance = $container->get(FooInterface::class);
+
+        $requested = self::eventsOf($events, ResolutionRequested::class);
+        $resolved = self::eventsOf($events, ServiceResolved::class);
+
+        self::assertCount(1, $requested);
+        self::assertSame(FooInterface::class, $requested[0]->id);
+        self::assertSame(0, $requested[0]->depth);
+
+        self::assertCount(1, $resolved);
+        self::assertSame(FooInterface::class, $resolved[0]->id);
+        self::assertSame(0, $resolved[0]->depth);
+        self::assertSame($instance, $resolved[0]->instance);
+        self::assertFalse($resolved[0]->fromCache);
+
+        // The failure path keeps the pairing too: one ResolutionRequested,
+        // one ResolutionFailed carrying the factory exception.
+        $failureEvents = new SpyEventDispatcher();
+        $failing = new Container(null, $failureEvents);
+        $failure = new RuntimeException('factory is broken');
+        $failing->factory(FooInterface::class, static fn (Container $c): object => throw $failure);
+
+        try {
+            $failing->get(FooInterface::class);
+            self::fail('Expected the factory exception to reach the caller.');
+        } catch (RuntimeException) {
+            // Expected: what matters is which events were dispatched.
+        }
+
+        $failed = self::eventsOf($failureEvents, ResolutionFailed::class);
+
+        self::assertCount(1, self::eventsOf($failureEvents, ResolutionRequested::class));
+        self::assertCount(1, $failed);
+        self::assertSame(FooInterface::class, $failed[0]->id);
+        self::assertSame(0, $failed[0]->depth);
+        self::assertSame($failure, $failed[0]->exception);
+        self::assertSame([], self::eventsOf($failureEvents, ServiceResolved::class));
+    }
+
+    public function testFactoryLogsDebugRecord(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+        $container->factory(FooInterface::class, static fn (Container $c): object => new Foo());
+
+        $container->get(FooInterface::class);
+
+        $record = self::singleRecordMatching($logger, 'Factory invoked for {id}');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame(FooInterface::class, $record['context']['id']);
+        self::assertSame(0, $record['context']['depth']);
+    }
+
+    public function testFactoryTakesPrecedenceOverAutowiring(): void
+    {
+        $container = new Container();
+        $sentinel = new GraphD();
+
+        // GraphD is perfectly autowirable; getting the sentinel back proves
+        // resolution never reached instantiate().
+        $container->factory(GraphD::class, static fn (Container $c): object => $sentinel);
+
+        self::assertSame($sentinel, $container->get(GraphD::class));
+    }
+
+    public function testFactoryFlushIsBenignForResolvedInstances(): void
+    {
+        $container = new Container();
+        $container->singleton(SharedService::class);
+
+        $first = $container->get(SharedService::class);
+
+        // Registrations after the fact — including a factory for the already
+        // resolved id itself — must not drop the cached instance: the shared
+        // cache is checked before the factory branch, like before bindings.
+        $container->factory(FooInterface::class, static fn (Container $c): object => new Foo());
+        $container->factory(SharedService::class, static fn (Container $c): object => new SharedService());
+        $container->bind(FooInterface::class, Foo::class);
+
+        self::assertSame($first, $container->get(SharedService::class));
     }
 
     /**
@@ -1922,6 +2190,19 @@ final class NeedsInjectedImpl
 {
     public function __construct(
         #[Inject(StripeGateway::class)] public readonly PaymentGateway $gw,
+    ) {
+    }
+}
+
+/**
+ * Built by a user factory in the tests: a service whose constructor mixes an
+ * autowirable dependency with a non-object argument no autowiring can infer.
+ */
+final class FactoryBuilt
+{
+    public function __construct(
+        public readonly GraphD $dep,
+        public readonly string $dsn,
     ) {
     }
 }

@@ -1061,6 +1061,125 @@ final class CompiledContainerTest extends TestCase
         }
     }
 
+    // ------------------------------------------------------------- factories
+
+    /**
+     * A factory id has no plan at all: it is excluded from compilation up
+     * front rather than attempted and failed, and a compiled container
+     * resolves it through the very same runtime factory branch — so cold and
+     * warm runs must be observationally identical to the runtime container.
+     */
+    public function testCompiledContainerResolvesFactoryRootThroughRuntimePath(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->factory(
+                CpFactoryPort::class,
+                static fn (Container $c): object => new CpFactoryAdapter($c->get(CpLeaf::class), 'dsn://x'),
+            );
+        };
+        $scenario = static fn (Container $c): object => $c->get(CpFactoryPort::class);
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertInstanceOf(CpFactoryAdapter::class, $reference['value']);
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+            self::assertInstanceOf(CpFactoryAdapter::class, $run['value'], $label);
+            self::assertSame('dsn://x', $run['value']->dsn, $label);
+        }
+
+        // The cache never saw the factory id: no plan was stored for it and
+        // none was even looked up. (The CpLeaf the factory pulls through
+        // get() compiles its own plan as any id does — that one may appear.)
+        $factoryKey = PlanCache::keyFor(
+            PlanCache::configHash([], [], [CpFactoryPort::class]),
+            CpFactoryPort::class,
+        );
+
+        self::assertNotContains($factoryKey, $cache->writes);
+        self::assertNotContains($factoryKey, $cache->reads);
+    }
+
+    /**
+     * The compiler sees the factory-bound interface as an ordinary unbound
+     * parameter type and compiles it into the parent's plan; at execution the
+     * child goes through the public get(), where the factory branch wins
+     * before the plan node is consulted. The parent rides the plan, the
+     * dependency rides the factory, and nothing observable diverges.
+     */
+    public function testCompiledParentWithFactoryDependencyMatchesRuntime(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->factory(
+                CpFactoryPort::class,
+                static fn (Container $c): object => new CpFactoryAdapter($c->get(CpLeaf::class), 'dsn://x'),
+            );
+        };
+        $scenario = static fn (Container $c): object => $c->get(CpNeedsPort::class);
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertInstanceOf(CpNeedsPort::class, $reference['value']);
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+            self::assertInstanceOf(CpNeedsPort::class, $run['value'], $label);
+            self::assertInstanceOf(CpFactoryAdapter::class, $run['value']->port, $label);
+        }
+
+        // The parent really did go through the compiled path — its plan is in
+        // the cache — while the factory id stored none.
+        $hash = PlanCache::configHash([], [], [CpFactoryPort::class]);
+
+        self::assertContains(PlanCache::keyFor($hash, CpNeedsPort::class), $cache->writes);
+        self::assertNotContains(PlanCache::keyFor($hash, CpFactoryPort::class), $cache->writes);
+    }
+
+    public function testRegisteringFactoryInvalidatesCompiledPlan(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+        $container->bind(CpGateway::class, CpGatewayA::class);
+
+        self::assertInstanceOf(CpGatewayA::class, $container->get(CpGateway::class));
+        self::assertCount(1, $cache->writes);
+        self::assertCount(1, $cache->reads);
+
+        $container->factory(CpGateway::class, static fn (Container $c): object => new CpGatewayB());
+
+        // Neither the in-memory node nor the cached plan may resurrect the
+        // compiled CpGatewayA construction: the id now resolves by factory,
+        // without touching the cache at all.
+        self::assertInstanceOf(CpGatewayB::class, $container->get(CpGateway::class));
+        self::assertCount(1, $cache->writes);
+        self::assertCount(1, $cache->reads);
+
+        // And the registration moved the config hash, so the old plan's key
+        // can never be looked up again by any container configured this way.
+        $oldHash = PlanCache::configHash([CpGateway::class => CpGatewayA::class], []);
+        $newHash = PlanCache::configHash(
+            [CpGateway::class => CpGatewayA::class],
+            [],
+            [CpGateway::class],
+        );
+
+        self::assertNotSame($oldHash, $newHash);
+        self::assertSame([PlanCache::keyFor($oldHash, CpGateway::class)], $cache->writes);
+    }
+
     // ------------------------------------------------------ guarded decisions
 
     public function testContainerWithCacheStillAutowiresItselfAndItsDependents(): void
@@ -1568,6 +1687,31 @@ final class CpNeedsContainer
 {
     public function __construct(public readonly Container $container)
     {
+    }
+}
+
+// Factory fixtures: the port is only ever satisfied by a user factory (no
+// binding exists), and the adapter mixes an autowired dependency with a
+// non-object argument no compilation could plan.
+interface CpFactoryPort
+{
+}
+
+final class CpFactoryAdapter implements CpFactoryPort
+{
+    public function __construct(
+        public readonly CpLeaf $leaf,
+        public readonly string $dsn,
+    ) {
+    }
+}
+
+final class CpNeedsPort
+{
+    public function __construct(
+        public readonly CpFactoryPort $port,
+        public readonly CpLeaf $leaf,
+    ) {
     }
 }
 
