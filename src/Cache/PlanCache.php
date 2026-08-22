@@ -43,6 +43,16 @@ final class PlanCache
      * the same cache entry, hence the sort before hashing. The format version
      * participates so that a library upgrade never resurrects an old payload.
      *
+     * The contextual map enters the hash whole — consumers, abstracts and
+     * concretes alike — because any of the three changes what a parameter
+     * compiles into. The inner maps are sorted too, so registration order
+     * never influences the hash on that level either.
+     *
+     * Of the factory map only the ids participate: a Closure cannot be
+     * serialised, and the body of a factory cannot change the plan of any
+     * other id — what matters to a plan is solely which ids are resolved by a
+     * factory instead of a compiled node.
+     *
      * The tag map is sorted by tag name only: the member lists inside keep
      * their order, because member order is semantic (it is the order of the
      * injected collection), so two registrations differing only in member
@@ -50,15 +60,34 @@ final class PlanCache
      *
      * @param array<class-string, class-string> $bindings
      * @param array<string, true> $shared
+     * @param array<class-string, array<class-string, class-string>> $contextual
+     * @param list<class-string> $factoryIds
      * @param array<string, list<class-string>> $tags
      */
-    public static function configHash(array $bindings, array $shared, array $tags = []): string
-    {
+    public static function configHash(
+        array $bindings,
+        array $shared,
+        array $contextual = [],
+        array $factoryIds = [],
+        array $tags = [],
+    ): string {
         ksort($bindings);
         ksort($shared);
+        ksort($contextual);
+
+        foreach ($contextual as &$abstractMap) {
+            ksort($abstractMap);
+        }
+
+        unset($abstractMap);
+
+        sort($factoryIds);
         ksort($tags);
 
-        return hash('sha256', serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $tags]));
+        return hash(
+            'sha256',
+            serialize([CompiledPlan::FORMAT_VERSION, $bindings, $shared, $contextual, $factoryIds, $tags]),
+        );
     }
 
     /**
