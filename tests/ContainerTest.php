@@ -17,6 +17,7 @@ use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
+use Error;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerExceptionInterface;
 use Psr\Container\ContainerInterface;
@@ -25,6 +26,7 @@ use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\AbstractLogger;
 use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
+use ReflectionClass;
 use ReflectionObject;
 use RuntimeException;
 use stdClass;
@@ -1511,6 +1513,321 @@ final class ContainerTest extends TestCase
         self::assertCount(2, self::eventsOf($events, ServiceResolved::class));
     }
 
+    // Lazy proxy resolution (PHP 8.4 native lazy objects). --------------------
+
+    public function testLazyReturnsProxyWithoutBuildingService(): void
+    {
+        LazyHeavy::$constructions = 0;
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyHeavy::class);
+
+        self::assertInstanceOf(LazyHeavy::class, $proxy);
+        self::assertSame(0, LazyHeavy::$constructions);
+        self::assertTrue(
+            (new ReflectionClass(LazyHeavy::class))->isUninitializedLazyObject($proxy),
+        );
+    }
+
+    public function testLazyProxyBuildsOnFirstAccess(): void
+    {
+        LazyHeavy::$constructions = 0;
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyHeavy::class);
+
+        self::assertSame(42, $proxy->answer());
+        self::assertSame(1, LazyHeavy::$constructions);
+    }
+
+    public function testLazyProxyBuildsOnlyOnce(): void
+    {
+        LazyHeavy::$constructions = 0;
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyHeavy::class);
+
+        $proxy->answer();
+        $proxy->answer();
+
+        self::assertSame(41, $proxy->value);
+        self::assertSame(1, LazyHeavy::$constructions);
+        self::assertFalse(
+            (new ReflectionClass(LazyHeavy::class))->isUninitializedLazyObject($proxy),
+        );
+    }
+
+    public function testLazyProxySatisfiesInterfaceType(): void
+    {
+        $container = new Container();
+        $container->bind(LazyRepoInterface::class, LazySqlRepo::class);
+
+        $proxy = $container->lazy(LazyRepoInterface::class);
+
+        // The proxy is built from the concrete class chosen at lazy() time,
+        // so it satisfies both the interface the caller asked for and the
+        // implementation behind the binding.
+        self::assertInstanceOf(LazyRepoInterface::class, $proxy);
+        self::assertInstanceOf(LazySqlRepo::class, $proxy);
+        self::assertSame('sqlite::memory:', $proxy->dsn());
+    }
+
+    public function testLazyProxyWorksForReadonlyPromotedConstructor(): void
+    {
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyReadonlyService::class);
+
+        self::assertTrue(
+            (new ReflectionClass(LazyReadonlyService::class))->isUninitializedLazyObject($proxy),
+        );
+
+        // The proxy strategy builds the real object through its ordinary
+        // constructor, so readonly promoted properties need no special
+        // handling — the ghost strategy would have had to write into them.
+        self::assertInstanceOf(GraphD::class, $proxy->dep);
+        self::assertSame('heavy', $proxy->label);
+    }
+
+    public function testLazyRespectsSingleton(): void
+    {
+        LazyHeavy::$constructions = 0;
+        $container = new Container();
+        $container->singleton(LazyHeavy::class);
+
+        $proxy = $container->lazy(LazyHeavy::class);
+
+        self::assertSame(0, LazyHeavy::$constructions);
+
+        $proxy->answer();
+
+        self::assertSame(1, LazyHeavy::$constructions);
+
+        $direct = $container->get(LazyHeavy::class);
+
+        // The deferred frame is an ordinary get(), so its result landed in
+        // the shared cache: the real instance behind the proxy IS the
+        // singleton, and the later get() built nothing new.
+        self::assertSame(1, LazyHeavy::$constructions);
+        self::assertSame(
+            (new ReflectionClass(LazyHeavy::class))->initializeLazyObject($proxy),
+            $direct,
+        );
+    }
+
+    public function testLazyOfMissingTypeThrowsImmediately(): void
+    {
+        $container = new Container();
+
+        // expectException proves the throw happens inside lazy() itself: no
+        // proxy exists yet, so nothing was ever there to be touched.
+        $this->expectException(NotFoundException::class);
+
+        $container->lazy('This\\Class\\Does\\Not\\Exist');
+    }
+
+    public function testLazyOfUnboundInterfaceThrowsImmediately(): void
+    {
+        $container = new Container();
+
+        try {
+            $container->lazy(FooInterface::class);
+            self::fail('Expected NotInstantiableException was not thrown.');
+        } catch (NotInstantiableException $exception) {
+            self::assertStringContainsString('interface', $exception->getMessage());
+            self::assertSame(FooInterface::class, $exception->getClassName());
+        }
+    }
+
+    public function testLazyBuildFailureSurfacesOnFirstAccess(): void
+    {
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyThrowsInConstructor::class);
+
+        try {
+            $unused = $proxy->x;
+            self::fail('Expected the constructor failure to surface on first access.');
+        } catch (RuntimeException $exception) {
+            // The exact class, not a subclass and not a wrapper: the
+            // construction failure reaches the touch point unchanged.
+            self::assertSame(RuntimeException::class, $exception::class);
+            self::assertSame('constructor exploded', $exception->getMessage());
+        }
+    }
+
+    public function testLazyProxyDispatchesEventsOnFirstAccessNotOnLazyCall(): void
+    {
+        LazyHeavy::$constructions = 0;
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $proxy = $container->lazy(LazyHeavy::class);
+
+        self::assertSame([], $events->events);
+
+        $proxy->answer();
+
+        $requested = self::eventsOf($events, ResolutionRequested::class);
+        $resolved = self::eventsOf($events, ServiceResolved::class);
+
+        self::assertCount(1, $requested);
+        self::assertSame(LazyHeavy::class, $requested[0]->id);
+        self::assertSame(0, $requested[0]->depth);
+
+        // The pairing invariant holds within the deferred frame: exactly one
+        // terminal event, only its moment moved from lazy() to the touch.
+        self::assertCount(1, $resolved);
+        self::assertSame(LazyHeavy::class, $resolved[0]->id);
+        self::assertSame(0, $resolved[0]->depth);
+        self::assertFalse($resolved[0]->fromCache);
+        self::assertSame([], self::eventsOf($events, ResolutionFailed::class));
+    }
+
+    public function testUntouchedLazyProxyDispatchesNoEvents(): void
+    {
+        $events = new SpyEventDispatcher();
+        $container = new Container(null, $events);
+
+        $container->lazy(LazyHeavy::class);
+
+        self::assertSame([], $events->events);
+    }
+
+    public function testLazyLogsDeferralDebugRecord(): void
+    {
+        $logger = new SpyLogger();
+        $container = new Container($logger);
+
+        $container->lazy(LazyHeavy::class);
+
+        $record = self::singleRecordMatching($logger, 'Deferring resolution');
+
+        self::assertSame(LogLevel::DEBUG, $record['level']);
+        self::assertSame(LazyHeavy::class, $record['context']['id']);
+        self::assertSame(LazyHeavy::class, $record['context']['concrete']);
+        self::assertSame(0, $record['context']['depth']);
+
+        // The deferral is the only record lazy() writes: the resolution
+        // records belong to the deferred frame, which has not happened yet.
+        self::assertCount(1, $logger->records);
+
+        // Placeholder discipline for this record, mirrored by hand: the
+        // cross-cutting tests drive exerciseEveryLoggedEvent(), which
+        // deliberately exercises the get() log points only.
+        preg_match_all('/\{([A-Za-z0-9_]+)\}/', $record['message'], $matches);
+
+        self::assertNotSame([], $matches[1]);
+
+        foreach ($matches[1] as $placeholder) {
+            self::assertArrayHasKey($placeholder, $record['context']);
+        }
+    }
+
+    public function testLazyReentrantInitializationDetectedAsCycle(): void
+    {
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyReentrantA::class);
+        LazyReentrantHolder::$proxy = $proxy;
+
+        try {
+            $proxy->touch();
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            $chain = $exception->getChain();
+
+            self::assertSame(
+                [LazyReentrantA::class, LazyReentrantB::class, LazyReentrantA::class],
+                $chain,
+            );
+            self::assertStringContainsString(' -> ', $exception->getMessage());
+
+            // The bare engine Error the touch actually produced stays
+            // attached, so the translation loses no diagnostic information.
+            self::assertInstanceOf(Error::class, $exception->getPrevious());
+            self::assertStringContainsString(
+                'must not be accessed before initialization',
+                $exception->getPrevious()->getMessage(),
+            );
+        } finally {
+            LazyReentrantHolder::$proxy = null;
+        }
+    }
+
+    public function testCycleThroughLazyProxyViaOrdinaryGet(): void
+    {
+        $container = new Container();
+
+        $proxy = $container->lazy(LazyCycleViaGetA::class);
+
+        try {
+            $unused = $proxy->x;
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException $exception) {
+            // The factory resolves through the ordinary get(), so a cycle
+            // that stays within the deferred frame is caught by the ordinary
+            // resolution stack — the shadow map never has to fire.
+            self::assertSame(
+                [LazyCycleViaGetA::class, LazyCycleViaGetB::class, LazyCycleViaGetA::class],
+                $exception->getChain(),
+            );
+        }
+    }
+
+    public function testResolutionStackCleanAfterLazyInit(): void
+    {
+        $container = new Container();
+
+        // A successful deferred initialization...
+        $healthy = $container->lazy(LazyHeavy::class);
+        $healthy->answer();
+
+        // ...a re-entrant touch caught through the shadow map...
+        $reentrant = $container->lazy(LazyReentrantA::class);
+        LazyReentrantHolder::$proxy = $reentrant;
+
+        try {
+            $reentrant->touch();
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException) {
+            // Expected: what matters is the state afterwards.
+        } finally {
+            LazyReentrantHolder::$proxy = null;
+        }
+
+        // ...and an ordinary get()-cycle inside a deferred frame.
+        $cyclic = $container->lazy(LazyCycleViaGetA::class);
+
+        try {
+            $unused = $cyclic->x;
+            self::fail('Expected CircularDependencyException was not thrown.');
+        } catch (CircularDependencyException) {
+            // Expected: what matters is the state afterwards.
+        }
+
+        $reflection = new ReflectionObject($container);
+
+        self::assertSame([], $reflection->getProperty('resolving')->getValue($container));
+        self::assertSame([], $reflection->getProperty('resolutionChain')->getValue($container));
+        self::assertSame([], $reflection->getProperty('lazyInitializing')->getValue($container));
+
+        self::assertInstanceOf(GraphA::class, $container->get(GraphA::class));
+    }
+
+    public function testOrdinaryGetStillBuildsEagerly(): void
+    {
+        LazyHeavy::$constructions = 0;
+        $container = new Container();
+
+        $service = $container->get(LazyHeavy::class);
+
+        self::assertSame(1, LazyHeavy::$constructions);
+        self::assertFalse(
+            (new ReflectionClass(LazyHeavy::class))->isUninitializedLazyObject($service),
+        );
+    }
+
     /**
      * @template TEvent of object
      * @param class-string<TEvent> $class
@@ -2067,6 +2384,120 @@ final class ThrowingDispatcher implements EventDispatcherInterface
         }
 
         return $event;
+    }
+}
+
+/**
+ * A "heavy" service for the lazy proxy tests: the static counter is the
+ * observable side effect that tells whether (and how many times) the
+ * constructor actually ran. Reset it at the start of every test that reads it.
+ */
+final class LazyHeavy
+{
+    public static int $constructions = 0;
+
+    public int $value = 41;
+
+    public function __construct()
+    {
+        ++self::$constructions;
+    }
+
+    public function answer(): int
+    {
+        // Reads state on purpose: a method that touches no property would
+        // not trigger the lazy initialization.
+        return $this->value + 1;
+    }
+}
+
+interface LazyRepoInterface
+{
+    public function dsn(): string;
+}
+
+final class LazySqlRepo implements LazyRepoInterface
+{
+    public function __construct(public readonly string $dsn = 'sqlite::memory:')
+    {
+    }
+
+    public function dsn(): string
+    {
+        return $this->dsn;
+    }
+}
+
+final class LazyReadonlyService
+{
+    public function __construct(
+        public readonly GraphD $dep,
+        public readonly string $label = 'heavy',
+    ) {
+    }
+}
+
+final class LazyThrowsInConstructor
+{
+    public int $x = 1;
+
+    public function __construct()
+    {
+        throw new RuntimeException('constructor exploded');
+    }
+}
+
+/**
+ * Hands the lazy proxy of LazyReentrantA to LazyReentrantB, which has no
+ * other way to reach it from inside its constructor.
+ */
+final class LazyReentrantHolder
+{
+    public static ?object $proxy = null;
+}
+
+final class LazyReentrantA
+{
+    public int $marker = 1;
+
+    public function __construct(public readonly LazyReentrantB $b)
+    {
+    }
+
+    public function touch(): int
+    {
+        // Reads state so that calling it on an uninitialized proxy triggers
+        // (or, mid-initialization, re-triggers) the lazy initialization.
+        return $this->marker;
+    }
+}
+
+/**
+ * Closes the cycle by touching the very proxy whose initialization is in
+ * flight — not by an ordinary get() — which is exactly the case PHP reports
+ * with a bare Error instead of re-entering the factory.
+ */
+final class LazyReentrantB
+{
+    public function __construct()
+    {
+        LazyReentrantHolder::$proxy?->touch();
+    }
+}
+
+final class LazyCycleViaGetA
+{
+    public int $x = 1;
+
+    public function __construct(public readonly LazyCycleViaGetB $b)
+    {
+    }
+}
+
+final class LazyCycleViaGetB
+{
+    public function __construct(public readonly LazyCycleViaGetA $a)
+    {
     }
 }
 

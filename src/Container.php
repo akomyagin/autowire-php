@@ -20,6 +20,7 @@ use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
+use Error;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Container\ContainerInterface;
 use Psr\EventDispatcher\EventDispatcherInterface;
@@ -85,6 +86,13 @@ use Throwable;
  * runtime path. The only additions are debug records about the plan cache
  * itself. Plans are invalidated by a hash of the bindings/shared maps and a
  * manifest of the class files that took part in compilation.
+ *
+ * lazy() hands out a native PHP 8.4 lazy proxy instead of a built object:
+ * the whole resolution — reflection, constructor, child get() calls, and with
+ * them every event and log record of the service — is deferred into one
+ * ordinary get() frame that runs at the first real access to the proxy. Eager
+ * resolution stays the default and is untouched: get() never returns a proxy.
+ * See lazy() for the exact contract of the shifted observability.
  */
 final class Container implements ContainerInterface
 {
@@ -108,6 +116,23 @@ final class Container implements ContainerInterface
      * @var list<string>
      */
     private array $resolutionChain = [];
+
+    /**
+     * Shadow stack of deferred initializations in flight: ids whose lazy
+     * proxy factory is currently executing, mapped to the concrete class
+     * chosen for them at lazy() time.
+     *
+     * A separate axis from the resolution stack: that one tracks the
+     * synchronous resolution path (and inside the proxy factory the ordinary
+     * get() still pushes onto it, so an A -> B -> A cycle within a deferred
+     * frame is caught by enter() as usual), while this map tracks which
+     * proxies are mid-initialization. It is what lets a touch of an
+     * initializing proxy be reported as a readable cycle instead of PHP's
+     * bare uninitialized-property Error — see lazyReentrantTouchAsCycle().
+     *
+     * @var array<string, class-string>
+     */
+    private array $lazyInitializing = [];
 
     /**
      * Ids registered as shared (singleton) via singleton().
@@ -384,6 +409,13 @@ final class Container implements ContainerInterface
                 $this->leave($id);
             }
         } catch (Throwable $exception) {
+            // Touching a lazy proxy that is already mid-initialization
+            // surfaces as a bare PHP Error, not as a re-entered factory (see
+            // lazyReentrantTouchAsCycle()); rewrite it into the container's
+            // cycle exception before the frame reports its failure. A no-op
+            // unless a deferred initialization is actually in flight.
+            $exception = $this->lazyReentrantTouchAsCycle($exception, $id);
+
             $this->dispatchAfterFailure(new ResolutionFailed($id, $depth, $exception), $exception);
 
             throw $exception;
@@ -395,6 +427,177 @@ final class Container implements ContainerInterface
         $this->dispatch(new ServiceResolved($id, $depth, $object, fromCache: false));
 
         return $object;
+    }
+
+    /**
+     * Hand out a lazy proxy for the given id: an object that is returned
+     * immediately, without building the service or its dependency graph, and
+     * is indistinguishable from the real service for the consumer —
+     * instanceof holds for the concrete class and for its interfaces, no
+     * explicit unwrapping exists. Built on PHP 8.4 native lazy objects
+     * (ReflectionClass::newLazyProxy()).
+     *
+     * Resolution is deferred: the real object is built at the first access
+     * to any property or method of the returned proxy, as one ordinary
+     * deferred get() frame for the concrete class chosen here. Exceptions of
+     * CONSTRUCTION (a failing constructor, an unresolvable deep dependency)
+     * therefore fly not out of lazy() but out of that first access — possibly
+     * far from the lazy() call site — unwrapped, exactly as get() would have
+     * thrown them. Errors of CLASS CHOICE (a missing type, an interface
+     * without a binding, a non-instantiable type) are thrown immediately from
+     * lazy() itself:
+     *
+     *     $svc = $container->lazy(Heavy::class); // does not throw, even if
+     *                                            // the Heavy constructor fails
+     *     $svc->run(); // the constructor exception surfaces here
+     *
+     * Observability is shifted with the resolution, as part of this contract:
+     * for a service obtained through lazy(), ResolutionRequested and its
+     * terminal event are dispatched not when lazy() is called but at the
+     * first real access to the proxy — deferred, outside the lazy() frame.
+     * If the proxy is never touched, none of the resolution events for this
+     * service is dispatched at all. The "exactly one terminal event per
+     * Requested" pairing holds within the deferred frame; only the moment of
+     * that frame is shifted relative to the lazy() call. The single record
+     * lazy() itself produces is a debug record of the deferral — a record of
+     * the fact of deferring, not of resolving.
+     *
+     * The concrete class is chosen here, immediately — reading the bindings
+     * map is configuration, not construction — and the choice is fixed: the
+     * deferred frame requests that very class even if the binding is
+     * re-registered before the first access. The deferred frame is therefore
+     * get($concrete), and the existing rule that the shared cache is keyed
+     * by the requested id applies to that request. A direct lazy($abstract)
+     * has no consumer frame, exactly like a direct get($abstract).
+     *
+     * A touch of the proxy while its own factory is still running closes a
+     * cycle and is reported as CircularDependencyException — see
+     * lazyReentrantTouchAsCycle(). Classes with readonly promoted properties
+     * need no special handling: the deferred frame runs their ordinary
+     * constructor. PHP itself refuses to make internal classes lazy; that
+     * refusal surfaces immediately as NotInstantiableException.
+     *
+     * In one narrow case CircularDependencyException can be a false positive:
+     * if the lazily-built class's own constructor reads one of its typed
+     * properties before assigning it (an ordinary read-before-write bug, no
+     * real cycle involved), PHP raises the same "must not be accessed before
+     * initialization" Error that a genuine re-entrant touch produces, and this
+     * method cannot tell the two apart from the message alone. Code that
+     * specifically catches CircularDependencyException (rather than the
+     * broader ContainerException) from a lazy() proxy and finds no real cycle
+     * should inspect getPrevious() for the original engine Error.
+     *
+     * @template T of object
+     * @param class-string<T> $id
+     * @return T
+     *
+     * @throws NotFoundException when the id is neither a binding nor an existing type.
+     * @throws NotInstantiableException when the chosen concrete class cannot be
+     *         instantiated or does not support lazy initialization.
+     */
+    public function lazy(string $id): object
+    {
+        $concrete = $this->bindings[$id] ?? $id;
+
+        if (!class_exists($concrete) && !interface_exists($concrete)) {
+            throw new NotFoundException($concrete);
+        }
+
+        $reflection = $this->reflectInstantiable($concrete);
+
+        $this->logger->debug(
+            'Deferring resolution of {id} behind a lazy proxy',
+            ['id' => $id, 'concrete' => $concrete, 'depth' => $this->depth()],
+        );
+
+        try {
+            return $reflection->newLazyProxy(function () use ($id, $concrete): object {
+                // The uninitialized pre-instance PHP passes to the factory is
+                // ignored on purpose: the real object is built by the ordinary
+                // get() below and the proxy delegates to it.
+                //
+                // This guard fires when a second proxy of the same id enters
+                // its factory while this one is still initializing. A touch of
+                // the *same* proxy never re-enters the factory — PHP throws a
+                // bare Error at the touch point instead (verified by probe
+                // under 8.4.24) and is translated by lazyReentrantTouchAsCycle().
+                if (isset($this->lazyInitializing[$id])) {
+                    throw new CircularDependencyException([...$this->resolutionChain, $id]);
+                }
+
+                $this->lazyInitializing[$id] = $concrete;
+
+                // The finally mirrors enter()/leave(): without it one failed
+                // deferred initialization would leave the id marked forever.
+                try {
+                    return $this->get($concrete);
+                } finally {
+                    unset($this->lazyInitializing[$id]);
+                }
+            });
+        } catch (Error $failure) {
+            // Creation-time refusal only (e.g. "Cannot make instance of
+            // internal class lazy"): the factory has not run, nothing was
+            // deferred, so failing fast with the container's own exception is
+            // more diagnosable than an engine Error out of a config call.
+            throw new NotInstantiableException(
+                $concrete,
+                'It does not support lazy initialization.',
+                $failure,
+            );
+        }
+    }
+
+    /**
+     * Translate the Error produced by touching a lazy proxy that is already
+     * being initialized into the container's cycle exception.
+     *
+     * PHP does not re-enter the proxy factory when the same proxy is touched
+     * during its own initialization — it throws a bare "Typed property X::$y
+     * must not be accessed before initialization" Error at the touch point
+     * (verified by probe under PHP 8.4.24). The factory can therefore never
+     * catch this re-entrancy itself; instead the Error is intercepted here,
+     * on the innermost get() frame it crosses, where the resolution path is
+     * still intact enough to yield a readable chain. The original Error stays
+     * attached as the previous exception.
+     *
+     * The rewrite is gated on a deferred initialization actually being in
+     * flight AND on the property's declaring class matching the concrete
+     * class of one of them, so an uninitialized-property Error outside the
+     * lazy path is never rewritten. (A constructor of the lazily built class
+     * reading its own typed property before assigning it would match too;
+     * even then the attached Error keeps the failure diagnosable.)
+     *
+     * The frame id is appended before the lazy id because the frame's own
+     * leave() already ran by the time the catch sees the Error: re-appending
+     * it restores the path the chain would have shown at the touch.
+     */
+    private function lazyReentrantTouchAsCycle(Throwable $exception, string $frameId): Throwable
+    {
+        if ($this->lazyInitializing === [] || !$exception instanceof Error) {
+            return $exception;
+        }
+
+        $matched = preg_match(
+            '/^Typed property ([^:]+)::\$\S+ must not be accessed before initialization$/',
+            $exception->getMessage(),
+            $matches,
+        );
+
+        if ($matched !== 1) {
+            return $exception;
+        }
+
+        foreach ($this->lazyInitializing as $lazyId => $concrete) {
+            if ($concrete === $matches[1] || is_a($concrete, $matches[1], true)) {
+                return new CircularDependencyException(
+                    [...$this->resolutionChain, $frameId, $lazyId],
+                    $exception,
+                );
+            }
+        }
+
+        return $exception;
     }
 
     /**
@@ -636,6 +839,18 @@ final class Container implements ContainerInterface
      */
     private function instantiate(string $concrete): object
     {
+        return $this->build($this->reflectInstantiable($concrete));
+    }
+
+    /**
+     * Reflect a concrete class, rejecting types that cannot be instantiated.
+     * Shared by the eager path above and by lazy(), which must fail fast on
+     * a class its deferred frame could never build.
+     *
+     * @throws NotInstantiableException when the type cannot be instantiated.
+     */
+    private function reflectInstantiable(string $concrete): ReflectionClass
+    {
         $reflection = new ReflectionClass($concrete);
 
         if (!$reflection->isInstantiable()) {
@@ -650,7 +865,7 @@ final class Container implements ContainerInterface
             throw new NotInstantiableException($concrete, $reason);
         }
 
-        return $this->build($reflection);
+        return $reflection;
     }
 
     /**
