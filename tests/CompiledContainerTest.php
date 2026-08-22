@@ -7,7 +7,9 @@ namespace AutowirePHP\Tests;
 use ArrayObject;
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Attribute\Tagged;
 use AutowirePHP\Cache\PlanCache;
+use AutowirePHP\Compiled\CompiledPlan;
 use AutowirePHP\Container;
 use AutowirePHP\Event\ResolutionFailed;
 use AutowirePHP\Event\ResolutionRequested;
@@ -48,7 +50,7 @@ use UnitEnum;
 final class CompiledContainerTest extends TestCase
 {
     /**
-     * The six resolution log records plus the listener-suppression record.
+     * The eight resolution log records plus the listener-suppression record.
      * Everything outside this list is about the plan cache itself — the only
      * observability difference the compiled mode is allowed to introduce.
      */
@@ -56,7 +58,9 @@ final class CompiledContainerTest extends TestCase
         'Resolving {id}',
         'Returning shared instance for {id} from cache',
         'Binding applied: {id} -> {concrete}',
+        'Tagged collection for parameter ${parameter} of {class}: resolving {count} members of tag {tag}',
         'Inject attribute applied to parameter ${parameter} of {class}: resolving as {target}',
+        'Contextual binding applied to parameter ${parameter} of {consumer}: resolving as {target}',
         'Caching shared instance for {id} (reason: {reason})',
         'Circular dependency detected: {chain}',
         'Listener of {event} threw {class} and was suppressed in favour of {failure}',
@@ -76,6 +80,7 @@ final class CompiledContainerTest extends TestCase
             static function (Container $container): void {
                 $container->bind(CpBoundInterface::class, CpBoundImpl::class);
                 $container->singleton(CpSharedByMethod::class);
+                $container->tag('cp.parity', [CpLeaf::class]);
             },
             static function (Container $container): object {
                 $container->get(CpParityRoot::class);
@@ -187,6 +192,40 @@ final class CompiledContainerTest extends TestCase
             $noConfig,
             static fn (Container $c): object => $c->get(ArrayObject::class),
         ];
+
+        yield 'tagged variadic collection' => [
+            static function (Container $container): void {
+                $container->tag('cp.handlers', [CpTagA::class, CpTagB::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'tagged variadic with duplicate and accumulated registration' => [
+            static function (Container $container): void {
+                $container->tag('cp.handlers', [CpTagB::class]);
+                $container->tag('cp.handlers', [CpTagA::class, CpTagB::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'tagged variadic with an unregistered tag' => [
+            $noConfig,
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'tagged variadic with a member that cannot be built' => [
+            static function (Container $container): void {
+                $container->tag('cp.handlers', [CpTagA::class, CpTagBroken::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedConsumer::class),
+        ];
+
+        yield 'cycle through a tagged member' => [
+            static function (Container $container): void {
+                $container->tag('cp.cycle', [CpTagCycleMember::class]);
+            },
+            static fn (Container $c): object => $c->get(CpTaggedCycleConsumer::class),
+        ];
     }
 
     /**
@@ -233,6 +272,9 @@ final class CompiledContainerTest extends TestCase
             self::assertSame($container->get(CpSharedByAttr::class), $root->sharedByAttr, $label);
             self::assertNull($root->note, $label);
             self::assertSame(42, $root->answer, $label);
+            // The 'cp.parity' tag is deliberately not registered here: a
+            // #[Tagged] variadic on an unregistered tag must keep receiving
+            // the empty set, in compiled mode too.
             self::assertSame([], $root->variadic, $label);
         }
     }
@@ -390,6 +432,194 @@ final class CompiledContainerTest extends TestCase
         $container->singleton(CpLeaf::class);
 
         self::assertSame($container->get(CpLeaf::class), $container->get(CpLeaf::class));
+    }
+
+    // ------------------------------------------------------ contextual binding
+
+    public function testCompiledContextualBindingMatchesRuntime(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->when(CpCtxConsumerOne::class, CpCtxContract::class, CpCtxImplA::class);
+            $container->when(CpCtxConsumerTwo::class, CpCtxContract::class, CpCtxImplB::class);
+        };
+        $scenario = static fn (Container $c): array => [
+            $c->get(CpCtxConsumerOne::class)->dep::class,
+            $c->get(CpCtxConsumerTwo::class)->dep::class,
+        ];
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertSame([CpCtxImplA::class, CpCtxImplB::class], $reference['value']);
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+            self::assertSame($reference['value'], $run['value'], $label . ': structure diverged');
+        }
+    }
+
+    public function testCompiledContextualPrioritiesMatchRuntime(): void
+    {
+        // Context vs the global bind(): wins for the consumer's parameter,
+        // stays inapplicable on the top-level get() of the abstract.
+        $bindConfig = static function (Container $container): void {
+            $container->bind(CpCtxContract::class, CpCtxImplA::class);
+            $container->when(CpCtxConsumerOne::class, CpCtxContract::class, CpCtxImplB::class);
+        };
+        $bindScenario = static fn (Container $c): array => [
+            $c->get(CpCtxConsumerOne::class)->dep::class,
+            $c->get(CpCtxContract::class)::class,
+        ];
+
+        // Context vs #[Inject]: wins on the annotated parameter, while the
+        // attribute keeps winning for a consumer without a context.
+        $injectConfig = static function (Container $container): void {
+            $container->when(CpCtxInjectConsumer::class, CpCtxContract::class, CpCtxImplB::class);
+        };
+        $injectScenario = static fn (Container $c): array => [
+            $c->get(CpCtxInjectConsumer::class)->dep::class,
+            $c->get(CpCtxInjectLoner::class)->dep::class,
+        ];
+
+        $cases = [
+            'context vs bind' => [$bindConfig, $bindScenario, [CpCtxImplB::class, CpCtxImplA::class]],
+            'context vs inject' => [$injectConfig, $injectScenario, [CpCtxImplB::class, CpCtxImplA::class]],
+        ];
+
+        foreach ($cases as $case => [$configure, $scenario, $expected]) {
+            $reference = self::observe(null, $configure, $scenario);
+
+            self::assertSame($expected, $reference['value'], $case);
+
+            $cache = new FakeSimpleCache();
+
+            foreach (['cold', 'warm'] as $label) {
+                $run = self::observe($cache, $configure, $scenario);
+
+                self::assertSame($reference['events'], $run['events'], $case . ', ' . $label . ': events');
+                self::assertSame($reference['log'], $run['log'], $case . ', ' . $label . ': log');
+                self::assertSame($reference['outcome'], $run['outcome'], $case . ', ' . $label . ': outcome');
+                self::assertSame($reference['value'], $run['value'], $case . ', ' . $label . ': structure');
+            }
+        }
+    }
+
+    public function testRegisteringContextualBindingInvalidatesCompiledPlan(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+        $container->bind(CpCtxContract::class, CpCtxImplA::class);
+
+        self::assertInstanceOf(CpCtxImplA::class, $container->get(CpCtxConsumerOne::class)->dep);
+        self::assertCount(1, $cache->writes);
+
+        $container->when(CpCtxConsumerOne::class, CpCtxContract::class, CpCtxImplB::class);
+
+        // The registration flushes the in-memory plans and the changed config
+        // hash lands on a different cache key: the plan compiled without the
+        // context is never reused, neither from memory nor from storage.
+        self::assertInstanceOf(CpCtxImplB::class, $container->get(CpCtxConsumerOne::class)->dep);
+        self::assertCount(2, $cache->writes);
+        self::assertNotSame($cache->writes[0], $cache->writes[1]);
+    }
+
+    public function testCompiledContextualCycleMatchesRuntime(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->when(CpCtxCycleA::class, CpCtxContract::class, CpCtxCycleB::class);
+            $container->when(CpCtxCycleB::class, CpCtxContract::class, CpCtxCycleA::class);
+        };
+        $scenario = static fn (Container $c): object => $c->get(CpCtxCycleA::class);
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertNotNull($reference['outcome']);
+        self::assertSame(CircularDependencyException::class, $reference['outcome'][0]);
+        self::assertStringContainsString(
+            CpCtxCycleA::class . ' -> ' . CpCtxCycleB::class . ' -> ' . CpCtxCycleA::class,
+            $reference['outcome'][1],
+        );
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+        }
+    }
+
+    public function testContextualFormatVersionBumpDiscardsOldPayload(): void
+    {
+        // The format stamp has been bumped twice (2 -> 3 for contextual
+        // binding, 3 -> 4 for tagged collections); a payload still carrying a
+        // stale stamp must be silently recompiled even if it somehow sits
+        // under the current cache key.
+        self::assertSame(4, CompiledPlan::FORMAT_VERSION);
+
+        $cache = new FakeSimpleCache();
+        (new Container(null, null, $cache))->get(CpService::class);
+
+        foreach ($cache->data as $key => $serialized) {
+            $payload = unserialize($serialized);
+            $payload['version'] = CompiledPlan::FORMAT_VERSION - 1;
+            $cache->data[$key] = serialize($payload);
+        }
+
+        $writesBefore = count($cache->writes);
+        $logger = new CpSpyLogger();
+        $container = new Container($logger, null, $cache);
+
+        self::assertInstanceOf(CpService::class, $container->get(CpService::class));
+        self::assertGreaterThan($writesBefore, count($cache->writes));
+        self::assertNotSame([], self::recordsMatching($logger, 'Discarded compiled plan'));
+    }
+
+    public function testTaggedCollectionSurvivesTheCacheRoundTrip(): void
+    {
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold', 'warm'] as $label) {
+            $container = new Container(null, null, $cache);
+            $container->tag('cp.handlers', [CpTagA::class, CpTagB::class]);
+
+            $consumer = $container->get(CpTaggedConsumer::class);
+
+            self::assertSame(
+                [CpTagA::class, CpTagB::class],
+                array_map(static fn (CpTagMember $m): string => $m::class, $consumer->members),
+                $label . ': member set or order diverged',
+            );
+        }
+
+        self::assertCount(1, $cache->writes, 'The warm run must load the baked tag, not recompile.');
+    }
+
+    public function testTaggedCollectionInvalidatesPlanOnTagRegistration(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+
+        self::assertSame([], $container->get(CpTaggedConsumer::class)->members);
+
+        // tag() must flush the loaded plans and land on a different cache key:
+        // the tag map participates in configHash, so the plan compiled for the
+        // empty tag can never be reused for the extended one.
+        $container->tag('cp.handlers', [CpTagA::class]);
+
+        $members = $container->get(CpTaggedConsumer::class)->members;
+
+        self::assertCount(1, $members);
+        self::assertInstanceOf(CpTagA::class, $members[0]);
+        self::assertCount(2, $cache->writes);
+        self::assertNotSame($cache->writes[0], $cache->writes[1]);
     }
 
     // ------------------------------------------------- the cache as storage
@@ -1061,6 +1291,125 @@ final class CompiledContainerTest extends TestCase
         }
     }
 
+    // ------------------------------------------------------------- factories
+
+    /**
+     * A factory id has no plan at all: it is excluded from compilation up
+     * front rather than attempted and failed, and a compiled container
+     * resolves it through the very same runtime factory branch — so cold and
+     * warm runs must be observationally identical to the runtime container.
+     */
+    public function testCompiledContainerResolvesFactoryRootThroughRuntimePath(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->factory(
+                CpFactoryPort::class,
+                static fn (Container $c): object => new CpFactoryAdapter($c->get(CpLeaf::class), 'dsn://x'),
+            );
+        };
+        $scenario = static fn (Container $c): object => $c->get(CpFactoryPort::class);
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertInstanceOf(CpFactoryAdapter::class, $reference['value']);
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+            self::assertInstanceOf(CpFactoryAdapter::class, $run['value'], $label);
+            self::assertSame('dsn://x', $run['value']->dsn, $label);
+        }
+
+        // The cache never saw the factory id: no plan was stored for it and
+        // none was even looked up. (The CpLeaf the factory pulls through
+        // get() compiles its own plan as any id does — that one may appear.)
+        $factoryKey = PlanCache::keyFor(
+            PlanCache::configHash([], [], factoryIds: [CpFactoryPort::class]),
+            CpFactoryPort::class,
+        );
+
+        self::assertNotContains($factoryKey, $cache->writes);
+        self::assertNotContains($factoryKey, $cache->reads);
+    }
+
+    /**
+     * The compiler sees the factory-bound interface as an ordinary unbound
+     * parameter type and compiles it into the parent's plan; at execution the
+     * child goes through the public get(), where the factory branch wins
+     * before the plan node is consulted. The parent rides the plan, the
+     * dependency rides the factory, and nothing observable diverges.
+     */
+    public function testCompiledParentWithFactoryDependencyMatchesRuntime(): void
+    {
+        $configure = static function (Container $container): void {
+            $container->factory(
+                CpFactoryPort::class,
+                static fn (Container $c): object => new CpFactoryAdapter($c->get(CpLeaf::class), 'dsn://x'),
+            );
+        };
+        $scenario = static fn (Container $c): object => $c->get(CpNeedsPort::class);
+
+        $reference = self::observe(null, $configure, $scenario);
+
+        self::assertInstanceOf(CpNeedsPort::class, $reference['value']);
+
+        $cache = new FakeSimpleCache();
+
+        foreach (['cold compiled run', 'warm compiled run'] as $label) {
+            $run = self::observe($cache, $configure, $scenario);
+
+            self::assertSame($reference['events'], $run['events'], $label . ': event stream diverged');
+            self::assertSame($reference['log'], $run['log'], $label . ': resolution log diverged');
+            self::assertSame($reference['outcome'], $run['outcome'], $label . ': outcome diverged');
+            self::assertInstanceOf(CpNeedsPort::class, $run['value'], $label);
+            self::assertInstanceOf(CpFactoryAdapter::class, $run['value']->port, $label);
+        }
+
+        // The parent really did go through the compiled path — its plan is in
+        // the cache — while the factory id stored none.
+        $hash = PlanCache::configHash([], [], factoryIds: [CpFactoryPort::class]);
+
+        self::assertContains(PlanCache::keyFor($hash, CpNeedsPort::class), $cache->writes);
+        self::assertNotContains(PlanCache::keyFor($hash, CpFactoryPort::class), $cache->writes);
+    }
+
+    public function testRegisteringFactoryInvalidatesCompiledPlan(): void
+    {
+        $cache = new FakeSimpleCache();
+        $container = new Container(null, null, $cache);
+        $container->bind(CpGateway::class, CpGatewayA::class);
+
+        self::assertInstanceOf(CpGatewayA::class, $container->get(CpGateway::class));
+        self::assertCount(1, $cache->writes);
+        self::assertCount(1, $cache->reads);
+
+        $container->factory(CpGateway::class, static fn (Container $c): object => new CpGatewayB());
+
+        // Neither the in-memory node nor the cached plan may resurrect the
+        // compiled CpGatewayA construction: the id now resolves by factory,
+        // without touching the cache at all.
+        self::assertInstanceOf(CpGatewayB::class, $container->get(CpGateway::class));
+        self::assertCount(1, $cache->writes);
+        self::assertCount(1, $cache->reads);
+
+        // And the registration moved the config hash, so the old plan's key
+        // can never be looked up again by any container configured this way.
+        $oldHash = PlanCache::configHash([CpGateway::class => CpGatewayA::class], []);
+        $newHash = PlanCache::configHash(
+            [CpGateway::class => CpGatewayA::class],
+            [],
+            factoryIds: [CpGateway::class],
+        );
+
+        self::assertNotSame($oldHash, $newHash);
+        self::assertSame([PlanCache::keyFor($oldHash, CpGateway::class)], $cache->writes);
+    }
+
     // ------------------------------------------------------ guarded decisions
 
     public function testContainerWithCacheStillAutowiresItselfAndItsDependents(): void
@@ -1472,7 +1821,9 @@ final class CpSharedByAttr implements CpAttrIface
  * plain service, service through a binding, #[Inject] service, resolving and
  * failing nullable probes, a union probe, shared instances of both flavours,
  * a nullable builtin (null spec), a defaulted builtin (deferred default spec)
- * and a variadic tail that cuts the argument list.
+ * and a #[Tagged] variadic tail (tagged spec). With the 'cp.parity' tag
+ * unregistered the tail still receives the empty set, so scenarios that do
+ * not call tag() keep the pre-tagging behaviour.
  */
 final class CpParityRoot
 {
@@ -1492,7 +1843,7 @@ final class CpParityRoot
         public readonly CpSharedByAttr $sharedByAttr,
         public readonly ?string $note,
         public readonly int $answer = 42,
-        CpLeaf ...$variadic,
+        #[Tagged('cp.parity')] CpLeaf ...$variadic,
     ) {
         $this->variadic = $variadic;
     }
@@ -1642,6 +1993,31 @@ final class CpNeedsContainer
     }
 }
 
+// Factory fixtures: the port is only ever satisfied by a user factory (no
+// binding exists), and the adapter mixes an autowired dependency with a
+// non-object argument no compilation could plan.
+interface CpFactoryPort
+{
+}
+
+final class CpFactoryAdapter implements CpFactoryPort
+{
+    public function __construct(
+        public readonly CpLeaf $leaf,
+        public readonly string $dsn,
+    ) {
+    }
+}
+
+final class CpNeedsPort
+{
+    public function __construct(
+        public readonly CpFactoryPort $port,
+        public readonly CpLeaf $leaf,
+    ) {
+    }
+}
+
 // Deliberately not final: CpThrowingDefaultDep must subtype it so that a
 // new-in-initializer default can satisfy the ?CpResolvableDep type.
 class CpResolvableDep
@@ -1743,6 +2119,124 @@ final class CpServiceOrCompileGhost
 final class CpServiceOrLateGhost
 {
     public function __construct(public readonly CpService|CpLateGhost $v)
+    {
+    }
+}
+
+// Fixtures for the contextual binding parity scenarios: one contract, two
+// implementations, consumers of every flavour the priority rules distinguish.
+
+interface CpCtxContract
+{
+}
+
+final class CpCtxImplA implements CpCtxContract
+{
+}
+
+final class CpCtxImplB implements CpCtxContract
+{
+}
+
+final class CpCtxConsumerOne
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+final class CpCtxConsumerTwo
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+final class CpCtxInjectConsumer
+{
+    public function __construct(
+        #[Inject(CpCtxImplA::class)] public readonly CpCtxContract $dep,
+    ) {
+    }
+}
+
+/**
+ * Same attribute but no contextual binding is ever registered for this class:
+ * the regression guard that a context registered for another consumer does
+ * not disturb #[Inject].
+ */
+final class CpCtxInjectLoner
+{
+    public function __construct(
+        #[Inject(CpCtxImplA::class)] public readonly CpCtxContract $dep,
+    ) {
+    }
+}
+
+final class CpCtxCycleA implements CpCtxContract
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+final class CpCtxCycleB implements CpCtxContract
+{
+    public function __construct(public readonly CpCtxContract $dep)
+    {
+    }
+}
+
+// Fixtures for the tagged variadic collections in compiled mode.
+
+interface CpTagMember
+{
+}
+
+final class CpTagA implements CpTagMember
+{
+}
+
+final class CpTagB implements CpTagMember
+{
+}
+
+final class CpTagBroken implements CpTagMember
+{
+    public function __construct(int $count)
+    {
+    }
+}
+
+final class CpTaggedConsumer
+{
+    /**
+     * @var list<CpTagMember>
+     */
+    public array $members;
+
+    public function __construct(#[Tagged('cp.handlers')] CpTagMember ...$members)
+    {
+        $this->members = $members;
+    }
+}
+
+final class CpTaggedCycleConsumer
+{
+    /**
+     * @var list<object>
+     */
+    public array $members;
+
+    public function __construct(#[Tagged('cp.cycle')] object ...$members)
+    {
+        $this->members = $members;
+    }
+}
+
+final class CpTagCycleMember
+{
+    public function __construct(public readonly CpTaggedCycleConsumer $parent)
     {
     }
 }

@@ -6,6 +6,7 @@ namespace AutowirePHP;
 
 use AutowirePHP\Attribute\Inject;
 use AutowirePHP\Attribute\Singleton;
+use AutowirePHP\Attribute\Tagged;
 use AutowirePHP\Cache\PlanCache;
 use AutowirePHP\Compiled\CompiledPlan;
 use AutowirePHP\Compiled\PlanCompiler;
@@ -20,6 +21,7 @@ use AutowirePHP\Exception\ListenerException;
 use AutowirePHP\Exception\NotFoundException;
 use AutowirePHP\Exception\NotInstantiableException;
 use AutowirePHP\Exception\UnresolvableParameterException;
+use Closure;
 use Error;
 use Psr\Cache\CacheItemPoolInterface;
 use Psr\Container\ContainerInterface;
@@ -32,6 +34,7 @@ use ReflectionNamedType;
 use ReflectionParameter;
 use ReflectionUnionType;
 use Throwable;
+use TypeError;
 
 /**
  * Framework-agnostic dependency injection container.
@@ -84,8 +87,14 @@ use Throwable;
  * this very get(), so everything observable (exceptions, events, log records,
  * depth accounting, shared instances) is produced by the same code as the
  * runtime path. The only additions are debug records about the plan cache
- * itself. Plans are invalidated by a hash of the bindings/shared maps and a
- * manifest of the class files that took part in compilation.
+ * itself. Plans are invalidated by a hash of the bindings/shared maps and the
+ * factory ids, and by a manifest of the class files that took part in
+ * compilation.
+ *
+ * An id registered through factory() is resolved by a user closure instead of
+ * reflection, inside the same get() frame and with the same observability;
+ * factory ids are excluded from the compiled mode entirely, because a Closure
+ * cannot be serialised into a plan.
  *
  * lazy() hands out a native PHP 8.4 lazy proxy instead of a built object:
  * the whole resolution — reflection, constructor, child get() calls, and with
@@ -142,11 +151,41 @@ final class Container implements ContainerInterface
     private array $shared = [];
 
     /**
+     * Contextual bindings registered via when(): consumer class -> abstract
+     * id -> concrete class to use for that consumer's constructor parameter.
+     *
+     * @var array<class-string, array<class-string, class-string>>
+     */
+    private array $contextual = [];
+
+    /**
+     * User factories, keyed by the id they resolve. A registered factory is
+     * the most specific way to build an id: get() checks this map before the
+     * compiled plan, the bindings and autowiring, so none of them apply to a
+     * factory id. Only the keys of this map participate in the config hash —
+     * a Closure cannot be serialised, and the factory body cannot change the
+     * plan of any other id.
+     *
+     * @var array<class-string, Closure>
+     */
+    private array $factories = [];
+
+    /**
      * Resolved shared instances, keyed by the id under which they were requested.
      *
      * @var array<string, object>
      */
     private array $instances = [];
+
+    /**
+     * Tag name -> ordered, deduplicated list of concrete classes registered
+     * under it via tag(). Keyed by the tag, not by the class: the consuming
+     * scenario is always "give me every member of tag T", so the map is read
+     * in exactly this direction and never has to be inverted.
+     *
+     * @var array<string, list<class-string>>
+     */
+    private array $tags = [];
 
     private readonly LoggerInterface $logger;
 
@@ -164,7 +203,7 @@ final class Container implements ContainerInterface
     /**
      * In-memory merge of the node maps of every plan loaded or compiled so
      * far, keyed by id. A get() for an id already present here never goes back
-     * to the cache. Flushed by bind()/singleton() — see flushPlans().
+     * to the cache. Flushed by bind()/singleton()/when() — see flushPlans().
      *
      * @var array<string, array<string, mixed>>
      */
@@ -274,6 +313,123 @@ final class Container implements ContainerInterface
     }
 
     /**
+     * Register concrete classes under a named tag. A variadic constructor
+     * parameter marked #[Tagged] with the same tag name receives one resolved
+     * instance per member instead of the default empty set.
+     *
+     * Repeated calls for one tag accumulate, never replace, so independent
+     * modules can append their handlers to a common tag. The collection order
+     * is the registration order; a class registered twice enters the tag once,
+     * at the position of its first occurrence.
+     *
+     * Every member resolves through an ordinary get(), so cycle detection,
+     * shared semantics, events and log records apply per member — and a member
+     * that cannot be built fails the whole resolution of the consumer instead
+     * of being silently dropped: a registered member is a deliberate part of
+     * the configuration, and its failure must surface, not shorten the
+     * collection by one. A tag nobody registered yields an empty collection —
+     * zero members is a legal state, not an error.
+     *
+     * This imperative call is deliberately the only registration path. A
+     * declarative #[Tag] class attribute was considered and rejected (user
+     * decision recorded in docs/POST_MVP_PLAN.md): PHP has no registry of all
+     * application classes, so the attribute could only be discovered on
+     * classes the container happens to reflect — membership would then depend
+     * on resolution order and diverge between the runtime and compiled paths.
+     *
+     * @param list<class-string> $concretes
+     */
+    public function tag(string $tag, array $concretes): void
+    {
+        foreach ($concretes as $concrete) {
+            if (!in_array($concrete, $this->tags[$tag] ?? [], true)) {
+                $this->tags[$tag][] = $concrete;
+            }
+        }
+
+        $this->flushPlans();
+    }
+
+    /**
+     * Register a contextual binding: when $consumer is being built and its
+     * constructor declares a parameter of type $abstract, resolve that
+     * parameter as $concrete instead of whatever the global configuration
+     * would produce.
+     *
+     * The consumer is the class being built — the same value error messages
+     * and the #[Inject] log record report — NOT the class that declared the
+     * constructor in an inheritance hierarchy. With `B extends A` and the
+     * constructor declared in A, resolving B applies the context registered
+     * for B, never the one registered for A. (The compilation manifest
+     * deliberately looks at the declaring class instead — that is about which
+     * files invalidate a cached plan, not about who the consumer is.)
+     *
+     * Parameter resolution priority: explicit bind() > contextual binding >
+     * #[Inject] attribute > autowiring by type. The context wins over a
+     * global bind() of the same abstract only inside the consumer's
+     * constructor; a direct top-level get($abstract) has no consumer and goes
+     * through bind()/autowiring unaffected.
+     *
+     * The redirect targets the chosen concrete class directly, so shared
+     * semantics apply to that concrete id (singleton(Concrete) / #[Singleton]
+     * on it). A singleton($abstract) on the interface is never shared across
+     * contextual consumers: their resolutions bypass the $abstract cache key
+     * entirely, each consumer builds its own concrete. This follows from the
+     * instance cache being keyed by the requested id and is deliberate — the
+     * redirect already segregates instances per concrete class correctly.
+     *
+     * Only single named-type parameters are checked: a union-typed parameter
+     * ($abstract being one of its members) never consults this map, matching
+     * how #[Inject] is already silently ignored on union parameters. This is
+     * the same rule applied consistently, not an oversight — see
+     * resolveUnionParameter()/compileUnionParameter().
+     *
+     * @param class-string $consumer
+     * @param class-string $abstract
+     * @param class-string $concrete
+     */
+    public function when(string $consumer, string $abstract, string $concrete): void
+    {
+        $this->contextual[$consumer][$abstract] = $concrete;
+        $this->flushPlans();
+    }
+
+    /**
+     * Register a user factory for an id: get($abstract) calls the closure
+     * instead of walking the constructor, and hands it this container so the
+     * factory can pull autowired dependencies through $c->get() and mix them
+     * with values the container cannot infer — a DSN, a flag. The factory
+     * takes precedence over bind(), #[Inject] and autowiring for the same id:
+     * resolution never reaches them, so when both a factory and a binding are
+     * registered for one id, the factory wins.
+     *
+     * The closure runs inside the ordinary get() frame, between the same
+     * PSR-14 events and on the same resolution path, so cycle detection,
+     * depth accounting, logging and the shared instance cache all apply
+     * unchanged. Only singleton() can mark a factory id as shared:
+     * #[Singleton] lives on a class, and which class the factory builds is
+     * its own decision. An exception thrown by the factory propagates to the
+     * caller unwrapped, exactly like an exception from a user constructor —
+     * wrapping it in a ContainerException would let an enclosing nullable or
+     * union probe absorb it and silently substitute null.
+     *
+     * A factory id never participates in the compiled mode: a Closure cannot
+     * be serialised into a plan, so the id always resolves through the
+     * runtime factory branch, and — like bind() — the registration flushes
+     * plans already loaded and moves the config hash, so a plan compiled
+     * before it can never be reused. Already resolved shared instances
+     * survive the registration, as they survive bind().
+     *
+     * @param class-string $abstract
+     * @param Closure(Container): object $factory
+     */
+    public function factory(string $abstract, Closure $factory): void
+    {
+        $this->factories[$abstract] = $factory;
+        $this->flushPlans();
+    }
+
+    /**
      * Drop every plan loaded into memory and the memoised config hash.
      *
      * Registrations must do this: a plan compiled before a singleton() call
@@ -341,9 +497,13 @@ final class Container implements ContainerInterface
             // In compiled mode, make sure a plan node for this id sits in
             // memory before the frame does any work: load it from the cache or
             // compile it now. Placed inside the try so that even an unexpected
-            // failure here keeps the event pairing intact.
+            // failure here keeps the event pairing intact. A factory id is
+            // excluded up front: it is unplannable by definition (a Closure
+            // cannot be serialised into a plan), so no compilation attempt is
+            // spent on it and it resolves through the factory branch below.
             if (
                 $this->planCache !== null
+                && !isset($this->factories[$id])
                 && !isset($this->planNodes[$id])
                 && !isset($this->unplannable[$id])
             ) {
@@ -353,49 +513,82 @@ final class Container implements ContainerInterface
             $this->enter($id);
 
             try {
-                $concrete = $this->bindings[$id] ?? $id;
-
-                // Logged before the existence check on purpose: when a binding
-                // points at a missing class, seeing which binding was applied is
-                // exactly what makes the following NotFoundException diagnosable.
-                if (isset($this->bindings[$id])) {
+                if (isset($this->factories[$id])) {
                     $this->logger->debug(
-                        'Binding applied: {id} -> {concrete}',
-                        ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
+                        'Factory invoked for {id}',
+                        ['id' => $id, 'depth' => $depth],
                     );
-                }
 
-                if (!class_exists($concrete) && !interface_exists($concrete)) {
-                    throw new NotFoundException($concrete);
-                }
+                    // The factory takes the place of instantiate(): it runs
+                    // inside this very frame, with $id already on the
+                    // resolution path, so a nested $c->get() inherits depth
+                    // and cycle detection, and a factory exception propagates
+                    // unwrapped like a constructor's. No second enter(): the
+                    // factory decides itself what to build, so $id is the
+                    // only id this frame knows about.
+                    $object = ($this->factories[$id])($this);
 
-                // The compiled path replaces exactly the instantiate() call
-                // below and nothing else; a missing node (compiled mode off,
-                // or plan preparation failed) means the runtime path.
-                $node = $this->planNodes[$id] ?? null;
+                    if (!is_object($object)) {
+                        throw new TypeError(sprintf(
+                            'Factory registered for "%s" must return an object, got %s.',
+                            $id,
+                            get_debug_type($object),
+                        ));
+                    }
 
-                if ($concrete !== $id) {
-                    $this->enter($concrete);
+                    // #[Singleton] lives on a class and the class a factory
+                    // builds is its own decision, so of the two halves of
+                    // sharedReason() only the singleton() registration can
+                    // apply to a factory id.
+                    $sharedReason = isset($this->shared[$id]) ? 'singleton()' : null;
+                } else {
+                    $concrete = $this->bindings[$id] ?? $id;
 
-                    try {
+                    // Logged before the existence check on purpose: when a
+                    // binding points at a missing class, seeing which binding
+                    // was applied is exactly what makes the following
+                    // NotFoundException diagnosable.
+                    if (isset($this->bindings[$id])) {
+                        $this->logger->debug(
+                            'Binding applied: {id} -> {concrete}',
+                            ['id' => $id, 'concrete' => $concrete, 'depth' => $depth],
+                        );
+                    }
+
+                    if (!class_exists($concrete) && !interface_exists($concrete)) {
+                        throw new NotFoundException($concrete);
+                    }
+
+                    // The compiled path replaces exactly the instantiate()
+                    // call below and nothing else; a missing node (compiled
+                    // mode off, or plan preparation failed) means the runtime
+                    // path.
+                    $node = $this->planNodes[$id] ?? null;
+
+                    if ($concrete !== $id) {
+                        $this->enter($concrete);
+
+                        try {
+                            $object = $node !== null
+                                ? $this->planExecutor->execute($node)
+                                : $this->instantiate($concrete);
+                        } finally {
+                            $this->leave($concrete);
+                        }
+                    } else {
                         $object = $node !== null
                             ? $this->planExecutor->execute($node)
                             : $this->instantiate($concrete);
-                    } finally {
-                        $this->leave($concrete);
                     }
-                } else {
-                    $object = $node !== null
-                        ? $this->planExecutor->execute($node)
-                        : $this->instantiate($concrete);
-                }
 
-                // On the compiled path the shared reason was computed by the
-                // compiler with the same priority; taking it from the node is
-                // what spares the second ReflectionClass of the runtime path.
-                $sharedReason = $node !== null
-                    ? ($node['shared'] ?? null)
-                    : $this->sharedReason($id, $concrete);
+                    // On the compiled path the shared reason was computed by
+                    // the compiler with the same priority; taking it from the
+                    // node is what spares the second ReflectionClass of the
+                    // runtime path.
+                    $sharedReason = $node !== null
+                        ? ($node['shared'] ?? null)
+                        : $this->sharedReason($id, $concrete);
+                }
 
                 if ($sharedReason !== null) {
                     $this->instances[$id] = $object;
@@ -764,7 +957,8 @@ final class Container implements ContainerInterface
                 }
             }
 
-            $plan = (new PlanCompiler($this->bindings, $this->shared))->compile($id, $hash);
+            $plan = (new PlanCompiler($this->bindings, $this->shared, $this->contextual, $this->tags))
+                ->compile($id, $hash);
 
             // See the array_merge() note above — same reasoning for a
             // freshly compiled plan's nodes.
@@ -789,13 +983,23 @@ final class Container implements ContainerInterface
     }
 
     /**
-     * Hash of the current bindings/shared maps, memoised until the next
-     * registration. Participates in every cache key, so changing a binding or
-     * registering a singleton can never reuse a plan compiled without it.
+     * Hash of the current bindings/shared/contextual/factories/tags
+     * configuration, memoised until the next registration. Participates in
+     * every cache key, so changing a binding, registering a singleton,
+     * registering a contextual binding, registering a factory or extending a
+     * tag can never reuse a plan compiled without it. Of the factories only
+     * the keys are hashed: which ids bypass the plan is configuration, the
+     * closure bodies are not.
      */
     private function configHash(): string
     {
-        return $this->configHash ??= PlanCache::configHash($this->bindings, $this->shared);
+        return $this->configHash ??= PlanCache::configHash(
+            $this->bindings,
+            $this->shared,
+            $this->contextual,
+            array_keys($this->factories),
+            $this->tags,
+        );
     }
 
     /**
@@ -882,7 +1086,16 @@ final class Container implements ContainerInterface
         $args = [];
 
         foreach ($constructor->getParameters() as $param) {
+            // A variadic parameter is always the last one. Untagged it ends
+            // the argument list and PHP fills it with an empty set; marked
+            // #[Tagged] it appends the resolved tag members as trailing
+            // positional arguments, which newInstanceArgs() spreads into the
+            // variadic tail.
             if ($param->isVariadic()) {
+                foreach ($this->resolveTaggedVariadic($param, $reflection->getName()) as $member) {
+                    $args[] = $member;
+                }
+
                 break;
             }
 
@@ -893,9 +1106,58 @@ final class Container implements ContainerInterface
     }
 
     /**
+     * Resolve the members for a #[Tagged] variadic parameter, or an empty
+     * list when the parameter carries no attribute or the tag has no members.
+     *
+     * Each member goes through an ordinary get(), so a member that cannot be
+     * built propagates its exception and fails the consumer — deliberately
+     * unlike the nullable/union probes, whose catch is part of the parameter
+     * contract; a tag member has no such contract, every member is mandatory.
+     * A cycle closing through a member is caught by the untouched
+     * enter()/leave() of the child frame.
+     *
+     * This branch has a second implementor: PlanCompiler bakes the same
+     * member list into a tagged spec, and PlanExecutor replays this very log
+     * record. Any change here must be mirrored there.
+     *
+     * @return list<object>
+     */
+    private function resolveTaggedVariadic(ReflectionParameter $param, string $declaringClass): array
+    {
+        $attributes = $param->getAttributes(Tagged::class);
+
+        if ($attributes === []) {
+            return [];
+        }
+
+        $tag = $attributes[0]->newInstance()->tag;
+        $ids = $this->tags[$tag] ?? [];
+
+        $this->logger->debug(
+            'Tagged collection for parameter ${parameter} of {class}: resolving {count} members of tag {tag}',
+            [
+                'parameter' => $param->getName(),
+                'class' => $declaringClass,
+                'tag' => $tag,
+                'count' => count($ids),
+                'depth' => $this->depth(),
+            ],
+        );
+
+        $members = [];
+
+        foreach ($ids as $id) {
+            $members[] = $this->get($id);
+        }
+
+        return $members;
+    }
+
+    /**
      * Resolve a single constructor parameter. Resolution priority: class type
-     * through the container -> union members in order -> default value -> null
-     * (if nullable) -> UnresolvableParameterException.
+     * through the container (contextual binding -> #[Inject] -> plain get) ->
+     * union members in order -> default value -> null (if nullable) ->
+     * UnresolvableParameterException.
      *
      * A CircularDependencyException is never swallowed while probing nullable
      * or union members: it always propagates to the caller.
@@ -915,6 +1177,24 @@ final class Container implements ContainerInterface
         }
 
         if ($type instanceof ReflectionNamedType && !$type->isBuiltin()) {
+            $contextual = $this->contextual[$declaringClass][$type->getName()] ?? null;
+            if ($contextual !== null) {
+                $this->logger->debug(
+                    // Like the #[Inject] target below, the chosen class may
+                    // itself be an abstraction that the following get()
+                    // re-resolves through bindings.
+                    'Contextual binding applied to parameter ${parameter} of {consumer}: resolving as {target}',
+                    [
+                        'parameter' => $param->getName(),
+                        'consumer' => $declaringClass,
+                        'target' => $contextual,
+                        'depth' => $this->depth(),
+                    ],
+                );
+
+                return $this->get($contextual);
+            }
+
             $injected = $this->resolveInjectTarget($param, $type->getName());
             if ($injected !== null) {
                 $this->logger->debug(
@@ -1004,6 +1284,11 @@ final class Container implements ContainerInterface
     /**
      * Resolve a union-typed constructor parameter by trying each class member
      * in declaration order, then falling back to the default value or null.
+     *
+     * Neither contextual bindings nor #[Inject] are consulted here — both are
+     * single-target mechanisms and a union parameter has no single target to
+     * redirect. This mirrors the existing #[Inject]-on-union behaviour; see
+     * Container::when().
      *
      * @throws UnresolvableParameterException when no union member can be
      *         resolved and there is no default value or null fallback.
